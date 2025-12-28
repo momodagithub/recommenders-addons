@@ -628,16 +628,20 @@ class RedisTableOfTensors final : public LookupInterface {
                     // Store key (id)
                     if (std::is_same<K, tstring>::value) {
                       ReplyMemcpyToKeyTensor<K>(pk_raw, id_str.data(), id_str.size());
-                    } else {
-                      // For numeric types, parse the string
+                    } else if (std::is_same<K, int64_t>::value) {
+                      // For int64_t, parse the string
                       try {
-                        if (std::is_same<K, int64_t>::value) {
-                          int64_t id_val = std::stoll(id_str);
-                          *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
-                        } else if (std::is_same<K, int32_t>::value) {
-                          int32_t id_val = std::stoi(id_str);
-                          *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
-                        }
+                        int64_t id_val = std::stoll(id_str);
+                        *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
+                      } catch (...) {
+                        LOG(WARNING) << "Failed to parse id from key: " << full_key;
+                        *const_cast<K*>(pk_raw) = static_cast<K>(0);
+                      }
+                    } else if (std::is_same<K, int32_t>::value) {
+                      // For int32_t, parse the string
+                      try {
+                        int32_t id_val = std::stoi(id_str);
+                        *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
                       } catch (...) {
                         LOG(WARNING) << "Failed to parse id from key: " << full_key;
                         *const_cast<K*>(pk_raw) = static_cast<K>(0);
@@ -1133,16 +1137,21 @@ class RedisTableOfTensors final : public LookupInterface {
             // Store key
             if (std::is_same<K, tstring>::value) {
               ReplyMemcpyToKeyTensor<K>(pk_raw, id_str.data(), id_str.size());
-            } else {
-              // For numeric types, parse the string
+            } else if (std::is_same<K, int64_t>::value) {
+              // For int64_t, parse the string
               try {
-                if (std::is_same<K, int64_t>::value) {
-                  int64_t id_val = std::stoll(id_str);
-                  *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
-                } else if (std::is_same<K, int32_t>::value) {
-                  int32_t id_val = std::stoi(id_str);
-                  *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
-                }
+                int64_t id_val = std::stoll(id_str);
+                *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
+              } catch (...) {
+                LOG(WARNING) << "Failed to parse id from key";
+                // Use zero as fallback
+                *const_cast<K*>(pk_raw) = static_cast<K>(0);
+              }
+            } else if (std::is_same<K, int32_t>::value) {
+              // For int32_t, parse the string
+              try {
+                int32_t id_val = std::stoi(id_str);
+                *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
               } catch (...) {
                 LOG(WARNING) << "Failed to parse id from key";
                 // Use zero as fallback
@@ -1283,7 +1292,6 @@ class RedisTableOfTensors final : public LookupInterface {
         if (redis_connection_params.using_small_key) {
           // Small key mode: SCAN returns only keys (full keys with prefix:id format)
           // MGET reply is stored in ThreadContext by HscanGetKeysValsInBucket
-          const std::string &prefix = keys_prefix_name_slices[i];
           const char separator = ':';
           
           // Get MGET reply from ThreadContext
@@ -1309,16 +1317,20 @@ class RedisTableOfTensors final : public LookupInterface {
               if (!id_str.empty()) {
                 if (std::is_same<K, tstring>::value) {
                   ReplyMemcpyToKeyTensor<K>(pk_raw, id_str.data(), id_str.size());
-                } else {
-                  // For numeric types, parse the string
+                } else if (std::is_same<K, int64_t>::value) {
+                  // For int64_t, parse the string
                   try {
-                    if (std::is_same<K, int64_t>::value) {
-                      int64_t id_val = std::stoll(id_str);
-                      *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
-                    } else if (std::is_same<K, int32_t>::value) {
-                      int32_t id_val = std::stoi(id_str);
-                      *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
-                    }
+                    int64_t id_val = std::stoll(id_str);
+                    *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
+                  } catch (...) {
+                    LOG(WARNING) << "Failed to parse id from key: " << full_key;
+                    *const_cast<K*>(pk_raw) = static_cast<K>(0);
+                  }
+                } else if (std::is_same<K, int32_t>::value) {
+                  // For int32_t, parse the string
+                  try {
+                    int32_t id_val = std::stoi(id_str);
+                    *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
                   } catch (...) {
                     LOG(WARNING) << "Failed to parse id from key: " << full_key;
                     *const_cast<K*>(pk_raw) = static_cast<K>(0);
