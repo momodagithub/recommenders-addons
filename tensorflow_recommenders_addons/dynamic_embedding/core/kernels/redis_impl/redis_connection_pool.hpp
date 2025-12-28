@@ -22,6 +22,8 @@ limitations under the License.
 
 #include <chrono>
 #include <iostream>
+#include <string>
+#include <type_traits>
 
 #include "redis_connection_util.hpp"
 
@@ -1051,16 +1053,16 @@ every bucket has its own BucketContext for sending data---for locating reply-
       assert(ptrs_0->front() == redis_command);
       assert(sizes_0->front() == redis_command_byte);
 
-      auto cmd = [](::sw::redis::Connection &connection, const int argc,
-                    const std::vector<const char *> *ptrs_0,
-                    const std::vector<std::size_t> *sizes_0) {
-        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
-                        sizes_0->data());
-      };
-
       std::vector<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>> reply;
       try {
-        reply.push_back(redis_conn_read->command(cmd, argc, ptrs_0, sizes_0));
+        reply.push_back(redis_conn_read->command(
+            [](::sw::redis::Connection &connection, const int argc,
+               const std::vector<const char *> *ptrs_0,
+               const std::vector<std::size_t> *sizes_0) {
+              connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                              sizes_0->data());
+            },
+            argc, ptrs_0, sizes_0));
       } catch (const std::exception &err) {
         reply.push_back(nullptr);
         LOG(ERROR) << "RedisHandler error in MGET_COMMAND for MGET "
@@ -1446,16 +1448,16 @@ every bucket has its own BucketContext for sending data---for locating reply-
       
       thread_context->full_keys_storage = full_keys;  // Keep strings alive
       
-      auto mget_cmd = [](::sw::redis::Connection &connection, const int argc,
-                         const std::vector<const char *> *ptrs_0,
-                         const std::vector<std::size_t> *sizes_0) {
-        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
-                        sizes_0->data());
-      };
-      
       std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> mget_reply;
       try {
-        mget_reply = redis_conn_read->command(mget_cmd, mget_argc, mget_ptrs, mget_sizes);
+        mget_reply = redis_conn_read->command(
+            [](::sw::redis::Connection &connection, const int argc,
+               const std::vector<const char *> *ptrs_0,
+               const std::vector<std::size_t> *sizes_0) {
+              connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                              sizes_0->data());
+            },
+            mget_argc, mget_ptrs, mget_sizes);
       } catch (const std::exception &err) {
         LOG(ERROR) << "RedisHandler error in MACCUM_COMMAND MGET (small key mode) "
                    << keys_prefix_name_slices[0] << " -- " << err.what();
@@ -1539,15 +1541,15 @@ every bucket has its own BucketContext for sending data---for locating reply-
       // Store accumulated_values in thread_context to keep data alive
       thread_context->accumulated_values_storage = std::move(accumulated_values);
       
-      auto mset_cmd = [](::sw::redis::Connection &connection, const int argc,
-                         const std::vector<const char *> *ptrs_0,
-                         const std::vector<std::size_t> *sizes_0) {
-        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
-                        sizes_0->data());
-      };
-      
       try {
-        redis_conn_write->command(mset_cmd, mset_argc, mset_ptrs, mset_sizes);
+        redis_conn_write->command(
+            [](::sw::redis::Connection &connection, const int argc,
+               const std::vector<const char *> *ptrs_0,
+               const std::vector<std::size_t> *sizes_0) {
+              connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                              sizes_0->data());
+            },
+            mset_argc, mset_ptrs, mset_sizes);
       } catch (const std::exception &err) {
         LOG(ERROR) << "RedisHandler error in MACCUM_COMMAND MSET (small key mode) "
                    << keys_prefix_name_slices[0] << " -- " << err.what();
@@ -1692,15 +1694,15 @@ every bucket has its own BucketContext for sending data---for locating reply-
       assert(ptrs_0->front() == redis_command);
       assert(sizes_0->front() == redis_command_byte);
 
-      auto cmd = [](::sw::redis::Connection &connection, const int argc,
-                    const std::vector<const char *> *ptrs_0,
-                    const std::vector<std::size_t> *sizes_0) {
-        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
-                        sizes_0->data());
-      };
-
       try {
-        /*auto reply=*/redis_conn_write->command(cmd, argc, ptrs_0, sizes_0);
+        /*auto reply=*/redis_conn_write->command(
+            [](::sw::redis::Connection &connection, const int argc,
+               const std::vector<const char *> *ptrs_0,
+               const std::vector<std::size_t> *sizes_0) {
+              connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                              sizes_0->data());
+            },
+            argc, ptrs_0, sizes_0);
       } catch (const std::exception &err) {
         LOG(ERROR) << "RedisHandler error in DEL_COMMAND for DEL "
                    << keys_prefix_name_slices[0] << " -- " << err.what();
