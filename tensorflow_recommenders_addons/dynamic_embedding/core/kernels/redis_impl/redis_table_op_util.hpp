@@ -370,6 +370,8 @@ Status ParseJsonConfig(const std::string *const redis_config_abs_dir,
 
   ReadOneJsonToParams(using_md5_prefix_name, boolean);
 
+  ReadOneJsonToParams(using_small_key, boolean);
+
   ReadOneJsonToParams(redis_hash_tags_hypodispersion, boolean);
 
   ReadStringOneJsonToParams(model_tag_import);

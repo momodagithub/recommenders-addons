@@ -166,6 +166,9 @@ struct Redis_Connection_Params {
       1024;  // Determines how many keys to send at a time
              // for performance tuning
   bool using_md5_prefix_name = false;
+  bool using_small_key =
+      false;  // If True, each embedding id will have an independent key.
+              // If False, use hash table (HMSET/HMGET) to store multiple ids in one key.
   bool redis_hash_tags_hypodispersion =
       false;  // distribution of storag_slice will be hypodispersion in 16354
               // regardless cluster slot, but still depends on
@@ -220,6 +223,7 @@ struct Redis_Connection_Params {
     using_hash_storage_slice = x.using_hash_storage_slice;
     keys_sending_size = x.keys_sending_size;
     using_md5_prefix_name = x.using_md5_prefix_name;
+    using_small_key = x.using_small_key;
     redis_hash_tags_hypodispersion = x.redis_hash_tags_hypodispersion;
     model_tag_import = x.model_tag_import;
     redis_hash_tags_import.assign(x.redis_hash_tags_import.begin(),
@@ -280,6 +284,9 @@ class ThreadContext {
   std::atomic<bool> thread_occupied{false};
   std::vector<std::unique_ptr<BucketContext>> buckets;
   std::unique_ptr<std::vector<unsigned>> bucket_locs;
+  std::vector<std::string> full_keys_storage;  // For storing full keys in small key mode
+  std::vector<std::vector<char>> accumulated_values_storage;  // For storing accumulated values in small key mode MaccumCommand
+  std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> mget_reply_storage;  // For storing MGET reply in small key mode HscanGetKeysValsInBucket
 
   void HandleReserve(const unsigned storage_slice, const unsigned vector_len,
                      const int keys_num) {
@@ -307,6 +314,9 @@ class ThreadContext {
         buckets[i].reset();
       }
     }
+    full_keys_storage.clear();
+    accumulated_values_storage.clear();
+    mget_reply_storage.reset();
   }
 
   ThreadContext() {
@@ -411,7 +421,8 @@ class RedisBaseWrapper {
 
   virtual std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>
   HscanGetKeysValsInBucket(const std::string &keys_prefix_name_slice,
-                           long long *cursor, const long long count) = 0;
+                           long long *cursor, const long long count,
+                           ThreadContext *thread_context = nullptr) = 0;
 
   virtual std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> MgetInBucket(
       const K *, const int64_t begin, const int64_t max_i,

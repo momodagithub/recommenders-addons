@@ -21,6 +21,7 @@
   "storage_slice": 1,
   "keys_sending_size": 1024,
   "using_md5_prefix_name": false,
+  "using_small_key": false,
   "model_tag_import": "test",
   "redis_hash_tags_import": [],
   "model_tag_runtime": "test",

@@ -317,66 +317,242 @@ class RedisWrapper<
 
   virtual size_t TableSizeInBucket(
       const std::string &keys_prefix_name_slice) override {
-    const std::string redis_command = "HLEN " + keys_prefix_name_slice;
-    auto cmd = [](::sw::redis::Connection &connection, const char *str) {
-      connection.send(str);
-    };
-    std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
-    try {
-      reply = redis_conn_read->command(cmd, redis_command.data());
-    } catch (const std::exception &err) {
-      LOG(ERROR) << "RedisHandler error in TableSizeInBucket for HLEN "
-                 << keys_prefix_name_slice << " -- " << err.what();
-      throw(err);
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use SCAN to count keys matching prefix:*
+      // Note: This is less efficient than HLEN but necessary for small key mode
+      size_t size = 0;
+      long long cursor = 0;
+      const std::string pattern = keys_prefix_name_slice + ":*";
+      
+      do {
+        std::string command_string = "SCAN " + std::to_string(cursor) + " MATCH " + pattern + " COUNT 1000";
+        auto cmd = [](::sw::redis::Connection &connection, const char *str) {
+          connection.send(str);
+        };
+        std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
+        try {
+          reply = redis_conn_read->command(cmd, command_string.data());
+        } catch (const std::exception &err) {
+          LOG(ERROR) << "RedisHandler error in TableSizeInBucket for SCAN "
+                     << keys_prefix_name_slice << " -- " << err.what();
+          break;
+        }
+        if (reply && reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2) {
+          // First element is cursor, second is array of keys
+          if (reply->element[0]->type == REDIS_REPLY_STRING) {
+            cursor = std::atoll(reply->element[0]->str);
+          }
+          if (reply->element[1]->type == REDIS_REPLY_ARRAY) {
+            size += reply->element[1]->elements;
+          }
+        } else {
+          break;
+        }
+      } while (cursor != 0);
+      
+      return size;
+    } else {
+      // Large key mode: use HLEN (original implementation)
+      const std::string redis_command = "HLEN " + keys_prefix_name_slice;
+      auto cmd = [](::sw::redis::Connection &connection, const char *str) {
+        connection.send(str);
+      };
+      std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
+      try {
+        reply = redis_conn_read->command(cmd, redis_command.data());
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in TableSizeInBucket for HLEN "
+                   << keys_prefix_name_slice << " -- " << err.what();
+        throw(err);
+      }
+      size_t size = 0;
+      if (reply->type == REDIS_REPLY_INTEGER)  // #define REDIS_REPLY_STRING 1
+      {
+        size = reply->integer;  // decimal
+      }
+      return size;
     }
-    size_t size = 0;
-    if (reply->type == REDIS_REPLY_INTEGER)  // #define REDIS_REPLY_STRING 1
-    {
-      size = reply->integer;  // decimal
-    }
-    return size;
   }
 
   virtual Status RemoveHkeysInBuckets(
       const std::string &keys_prefix_name_slice) override {
-    // std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
-    const std::string redis_command = "DEL " + keys_prefix_name_slice;
-    auto cmd = [](::sw::redis::Connection &connection, const char *str) {
-      connection.send(str);
-    };
-    try {
-      /*reply=*/redis_conn_write->command(cmd, redis_command.data());
-    } catch (const std::exception &err) {
-      LOG(ERROR) << "RedisHandler error in RemoveHkeysInBuckets for "
-                 << keys_prefix_name_slice << " -- " << err.what();
-      return errors::Unknown(err.what());
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use SCAN + DEL to remove all keys matching prefix:*
+      const std::string pattern = keys_prefix_name_slice + ":*";
+      long long cursor = 0;
+      
+      do {
+        // First, scan for keys
+        std::string scan_command = "SCAN " + std::to_string(cursor) + " MATCH " + pattern + " COUNT 1000";
+        auto scan_cmd = [](::sw::redis::Connection &connection, const char *str) {
+          connection.send(str);
+        };
+        std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> scan_reply;
+        try {
+          scan_reply = redis_conn_read->command(scan_cmd, scan_command.data());
+        } catch (const std::exception &err) {
+          LOG(ERROR) << "RedisHandler error in RemoveHkeysInBuckets SCAN for "
+                     << keys_prefix_name_slice << " -- " << err.what();
+          return errors::Unknown(err.what());
+        }
+        
+        if (!scan_reply || scan_reply->type != REDIS_REPLY_ARRAY || scan_reply->elements < 2) {
+          break;
+        }
+        
+        if (scan_reply->element[0]->type == REDIS_REPLY_STRING) {
+          cursor = std::atoll(scan_reply->element[0]->str);
+        }
+        
+        // Delete found keys
+        if (scan_reply->element[1]->type == REDIS_REPLY_ARRAY && scan_reply->element[1]->elements > 0) {
+          std::string del_command = "DEL";
+          for (size_t i = 0; i < scan_reply->element[1]->elements; ++i) {
+            if (scan_reply->element[1]->element[i]->type == REDIS_REPLY_STRING) {
+              del_command += " " + std::string(scan_reply->element[1]->element[i]->str,
+                                                scan_reply->element[1]->element[i]->len);
+            }
+          }
+          auto del_cmd = [](::sw::redis::Connection &connection, const char *str) {
+            connection.send(str);
+          };
+          try {
+            redis_conn_write->command(del_cmd, del_command.data());
+          } catch (const std::exception &err) {
+            LOG(ERROR) << "RedisHandler error in RemoveHkeysInBuckets DEL for "
+                       << keys_prefix_name_slice << " -- " << err.what();
+            // Continue to try deleting remaining keys
+          }
+        }
+      } while (cursor != 0);
+      
+      return Status::OK();
+    } else {
+      // Large key mode: use DEL (original implementation)
+      const std::string redis_command = "DEL " + keys_prefix_name_slice;
+      auto cmd = [](::sw::redis::Connection &connection, const char *str) {
+        connection.send(str);
+      };
+      try {
+        /*reply=*/redis_conn_write->command(cmd, redis_command.data());
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in RemoveHkeysInBuckets for "
+                   << keys_prefix_name_slice << " -- " << err.what();
+        return errors::Unknown(err.what());
+      }
+      return Status::OK();
     }
-    return Status::OK();
   }
 
   virtual std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>
   HscanGetKeysValsInBucket(const std::string &keys_prefix_name_slice,
-                           long long *cursor, const long long count) override {
-    std::string command_string = "HSCAN " + keys_prefix_name_slice + ' ' +
-                                 std::to_string(*cursor) + " COUNT " +
-                                 std::to_string(count);
-    auto cmd = [](::sw::redis::Connection &connection, const char *str) {
-      connection.send(str);
-    };
-    std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
-    try {
-      reply = redis_conn_read->command(cmd, command_string.data());
-    } catch (const std::exception &err) {
-      LOG(ERROR) << "RedisHandler error in HscanGetKeysValsInBucket for slices "
-                 << keys_prefix_name_slice << " -- " << err.what();
-    }
-    if (reply->element[0]->type == REDIS_REPLY_STRING) {
-      // #define REDIS_REPLY_STRING 1
-      *cursor = std::atoll(reply->element[0]->str);
+                           long long *cursor, const long long count,
+                           ThreadContext *thread_context = nullptr) override {
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use SCAN to get keys, then GET for values
+      // This is more complex than HSCAN, so we need to construct a similar reply structure
+      const std::string pattern = keys_prefix_name_slice + ":*";
+      std::string command_string = "SCAN " + std::to_string(*cursor) + " MATCH " + pattern + " COUNT " + std::to_string(count);
+      auto cmd = [](::sw::redis::Connection &connection, const char *str) {
+        connection.send(str);
+      };
+      std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
+      try {
+        reply = redis_conn_read->command(cmd, command_string.data());
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in HscanGetKeysValsInBucket SCAN for slices "
+                   << keys_prefix_name_slice << " -- " << err.what();
+        return nullptr;
+      }
+      
+      if (reply && reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2) {
+        if (reply->element[0]->type == REDIS_REPLY_STRING) {
+          *cursor = std::atoll(reply->element[0]->str);
+        }
+        
+        // For small key mode, we need to get values for each key using MGET
+        // Then construct a reply structure similar to HSCAN (key, value, key, value...)
+        redisReply *keys_array = reply->element[1];
+        if (keys_array->type != REDIS_REPLY_ARRAY || keys_array->elements == 0) {
+          // No keys found, return empty result similar to HSCAN
+          return reply;
+        }
+        
+        // Build MGET command to get values for all keys
+        const int key_count = keys_array->elements;
+        const int mget_argc = key_count + 1;
+        const static char *mget_command = "MGET";
+        const static std::size_t mget_command_byte = 4;
+        
+        // Prepare MGET command arguments
+        std::vector<const char*> mget_argv(mget_argc);
+        std::vector<size_t> mget_argvlen(mget_argc);
+        mget_argv[0] = mget_command;
+        mget_argvlen[0] = mget_command_byte;
+        
+        for (int i = 0; i < key_count; ++i) {
+          if (keys_array->element[i]->type == REDIS_REPLY_STRING) {
+            mget_argv[i + 1] = keys_array->element[i]->str;
+            mget_argvlen[i + 1] = keys_array->element[i]->len;
+          }
+        }
+        
+        // Execute MGET
+        auto mget_cmd = [&mget_argv, &mget_argvlen](::sw::redis::Connection &connection) {
+          connection.send(static_cast<int>(mget_argv.size()),
+                         const_cast<const char **>(mget_argv.data()),
+                         mget_argvlen.data());
+        };
+        
+        std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> mget_reply;
+        try {
+          mget_reply = redis_conn_read->command(mget_cmd);
+        } catch (const std::exception &err) {
+          LOG(ERROR) << "RedisHandler error in HscanGetKeysValsInBucket MGET for slices "
+                     << keys_prefix_name_slice << " -- " << err.what();
+          return nullptr;
+        }
+        
+        if (!mget_reply || mget_reply->type != REDIS_REPLY_ARRAY) {
+          LOG(ERROR) << "Invalid MGET reply in HscanGetKeysValsInBucket for slices "
+                     << keys_prefix_name_slice;
+          return nullptr;
+        }
+        
+        // Store MGET reply in ThreadContext for ExportValuesToTensor to use
+        if (thread_context) {
+          thread_context->mget_reply_storage = std::move(mget_reply);
+        }
+        
+        // Return SCAN reply (with keys only)
+        // ExportValuesToTensor will use the stored MGET reply to get values
+        return reply;
+      } else {
+        return nullptr;
+      }
     } else {
-      return nullptr;
+      // Large key mode: use HSCAN (original implementation)
+      std::string command_string = "HSCAN " + keys_prefix_name_slice + ' ' +
+                                   std::to_string(*cursor) + " COUNT " +
+                                   std::to_string(count);
+      auto cmd = [](::sw::redis::Connection &connection, const char *str) {
+        connection.send(str);
+      };
+      std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
+      try {
+        reply = redis_conn_read->command(cmd, command_string.data());
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in HscanGetKeysValsInBucket for slices "
+                   << keys_prefix_name_slice << " -- " << err.what();
+      }
+      if (reply && reply->element[0]->type == REDIS_REPLY_STRING) {
+        // #define REDIS_REPLY_STRING 1
+        *cursor = std::atoll(reply->element[0]->str);
+      } else {
+        return nullptr;
+      }
+      return reply;
     }
-    return reply;
   }
 
   virtual std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> MgetInBucket(
@@ -822,58 +998,130 @@ every bucket has its own BucketContext for sending data---for locating reply-
       const K *keys, ThreadContext *thread_context, const int64_t begin,
       const int64_t max_i,
       const std::vector<std::string> &keys_prefix_name_slices) override {
-    const int argc = (max_i - begin) + 2;
+    const int total = max_i - begin;
+    
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use MGET with full keys (prefix:id)
+      const int argc = total + 1;
+      const static char *redis_command = "MGET";
+      const static std::size_t redis_command_byte = 4;
 
-    const static char *redis_command = "HMGET";
-    const static std::size_t redis_command_byte = 5;
+      thread_context->HandleReserve(1U, argc, 0);
 
-    thread_context->HandleReserve(1U, argc, 0);
+      std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
+      std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
 
-    std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
-    std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
 
-    const K *const pk_raw_end = keys + max_i;
-    const K *pk_raw = keys + begin;
+      // Store full key strings in thread context
+      std::vector<std::string> full_keys;
+      full_keys.reserve(total);
+      
+      const std::string &prefix = keys_prefix_name_slices[0];
+      const char separator = ':';
 
-    auto ptrs_iter = ptrs_0->begin();
-    *ptrs_iter = redis_command;
-    ++ptrs_iter;
-    *ptrs_iter = keys_prefix_name_slices[0].data();
-    ++ptrs_iter;
-
-    auto sizes_iter = sizes_0->begin();
-    *sizes_iter = redis_command_byte;
-    ++sizes_iter;
-    *sizes_iter = keys_prefix_name_slices[0].size();
-    ++sizes_iter;
-
-    for (; pk_raw != pk_raw_end; ++pk_raw) {
-      *ptrs_iter = KContentPointer<K>(
-          pk_raw);  // Direct access to Tensor data in TensorFlow
+      auto ptrs_iter = ptrs_0->begin();
+      *ptrs_iter = redis_command;
       ++ptrs_iter;
-      *sizes_iter = KTypeSize<K>(pk_raw);  // key data char size
+
+      auto sizes_iter = sizes_0->begin();
+      *sizes_iter = redis_command_byte;
       ++sizes_iter;
+
+      for (; pk_raw != pk_raw_end; ++pk_raw) {
+        // Build full key: prefix:id
+        std::string full_key = prefix + separator;
+        if (std::is_same<K, tstring>::value) {
+          full_key += std::string(pk_raw->data(), pk_raw->size());
+        } else {
+          full_key += std::to_string(*pk_raw);
+        }
+        full_keys.push_back(full_key);
+        
+        *ptrs_iter = full_keys.back().data();
+        ++ptrs_iter;
+        *sizes_iter = full_keys.back().size();
+        ++sizes_iter;
+      }
+
+      // Store full_keys in thread_context to keep strings alive
+      thread_context->full_keys_storage = std::move(full_keys);
+
+      assert(ptrs_0->front() == redis_command);
+      assert(sizes_0->front() == redis_command_byte);
+
+      auto cmd = [](::sw::redis::Connection &connection, const int argc,
+                    const std::vector<const char *> *ptrs_0,
+                    const std::vector<std::size_t> *sizes_0) {
+        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                        sizes_0->data());
+      };
+
+      std::vector<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>> reply;
+      try {
+        reply.push_back(redis_conn_read->command(cmd, argc, ptrs_0, sizes_0));
+      } catch (const std::exception &err) {
+        reply.push_back(nullptr);
+        LOG(ERROR) << "RedisHandler error in MGET_COMMAND for MGET "
+                   << keys_prefix_name_slices[0] << " -- " << err.what();
+      }
+      return reply;
+    } else {
+      // Large key mode: use HMGET (original implementation)
+      const int argc = total + 2;
+
+      const static char *redis_command = "HMGET";
+      const static std::size_t redis_command_byte = 5;
+
+      thread_context->HandleReserve(1U, argc, 0);
+
+      std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
+      std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
+
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
+
+      auto ptrs_iter = ptrs_0->begin();
+      *ptrs_iter = redis_command;
+      ++ptrs_iter;
+      *ptrs_iter = keys_prefix_name_slices[0].data();
+      ++ptrs_iter;
+
+      auto sizes_iter = sizes_0->begin();
+      *sizes_iter = redis_command_byte;
+      ++sizes_iter;
+      *sizes_iter = keys_prefix_name_slices[0].size();
+      ++sizes_iter;
+
+      for (; pk_raw != pk_raw_end; ++pk_raw) {
+        *ptrs_iter = KContentPointer<K>(
+            pk_raw);  // Direct access to Tensor data in TensorFlow
+        ++ptrs_iter;
+        *sizes_iter = KTypeSize<K>(pk_raw);  // key data char size
+        ++sizes_iter;
+      }
+
+      assert(ptrs_0->front() == redis_command);
+      assert(sizes_0->front() == redis_command_byte);
+
+      auto cmd = [](::sw::redis::Connection &connection, const int argc,
+                    const std::vector<const char *> *ptrs_0,
+                    const std::vector<std::size_t> *sizes_0) {
+        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                        sizes_0->data());
+      };
+
+      std::vector<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>> reply;
+      try {
+        reply.push_back(redis_conn_read->command(cmd, argc, ptrs_0, sizes_0));
+      } catch (const std::exception &err) {
+        reply.push_back(nullptr);
+        LOG(ERROR) << "RedisHandler error in MGET_COMMAND for HMGET "
+                   << keys_prefix_name_slices[0] << " -- " << err.what();
+      }
+      return reply;
     }
-
-    assert(ptrs_0->front() == redis_command);
-    assert(sizes_0->front() == redis_command_byte);
-
-    auto cmd = [](::sw::redis::Connection &connection, const int argc,
-                  const std::vector<const char *> *ptrs_0,
-                  const std::vector<std::size_t> *sizes_0) {
-      connection.send(argc, const_cast<const char **>(ptrs_0->data()),
-                      sizes_0->data());
-    };
-
-    std::vector<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>> reply;
-    try {
-      reply.push_back(redis_conn_read->command(cmd, argc, ptrs_0, sizes_0));
-    } catch (const std::exception &err) {
-      reply.push_back(nullptr);
-      LOG(ERROR) << "RedisHandler error in MGET_COMMAND for HMGET "
-                 << keys_prefix_name_slices[0] << " -- " << err.what();
-    }
-    return reply;
   }
 
   inline void CopyDefaultToTensor(const bool is_full_default, const V *pv_raw,
@@ -988,74 +1236,160 @@ every bucket has its own BucketContext for sending data---for locating reply-
       const K *keys, const V *values, ThreadContext *thread_context,
       const int64_t begin, const int64_t max_i, const int64_t Velems_per_dim0,
       const std::vector<std::string> &keys_prefix_name_slices) override {
-    const int &&total = max_i - begin;
-    const int &&argc = total * 2 + 2;
+    const int total = max_i - begin;
+    
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use MSET with full keys (prefix:id)
+      const int argc = total * 2 + 1;
+      const static char *redis_command = "MSET";
+      const static std::size_t redis_command_byte = 4;
 
-    const static char *redis_command = "HMSET";
-    const static std::size_t redis_command_byte = 5;
+      thread_context->HandleReserve(1U, argc, 0);
 
-    thread_context->HandleReserve(1U, argc, 0);
+      std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
+      std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
 
-    std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
-    std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
 
-    const K *const pk_raw_end = keys + max_i;
-    const K *pk_raw = keys + begin;
+      const std::size_t V_byte_size = Velems_per_dim0 * sizeof(V);
+      const V *pv_raw = values + begin * Velems_per_dim0;
 
-    const std::size_t &&V_byte_size = Velems_per_dim0 * sizeof(V);
+      // Store full key strings in thread context
+      std::vector<std::string> full_keys;
+      full_keys.reserve(total);
+      
+      const std::string &prefix = keys_prefix_name_slices[0];
+      const char separator = ':';
 
-    const V *pv_raw = values + begin * Velems_per_dim0;
-
-    auto ptrs_iter = ptrs_0->begin();
-    *ptrs_iter = redis_command;
-    ++ptrs_iter;
-    *ptrs_iter = keys_prefix_name_slices[0].data();
-    ++ptrs_iter;
-
-    auto sizes_iter = sizes_0->begin();
-    *sizes_iter = redis_command_byte;
-    ++sizes_iter;
-    *sizes_iter = keys_prefix_name_slices[0].size();
-    ++sizes_iter;
-
-    VContentAndTypeSizeResult VCATS_temp;
-    // std::vector<char> for storage all string in one KV pair
-    std::vector<std::vector<char>> buff_temp(total);
-
-    for (int i = 0; pk_raw != pk_raw_end;
-         ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
-      VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
-                                          V_byte_size, pv_raw, buff_temp[i]);
-
-      *ptrs_iter = KContentPointer<K>(
-          pk_raw);  // Direct access to Tensor data in TensorFlow
-      *(++ptrs_iter) = VCATS_temp.VContentPointer;
+      auto ptrs_iter = ptrs_0->begin();
+      *ptrs_iter = redis_command;
       ++ptrs_iter;
 
-      *sizes_iter = KTypeSize<K>(pk_raw);  // key data char size
-      *(++sizes_iter) = VCATS_temp.VTypeSize;
+      auto sizes_iter = sizes_0->begin();
+      *sizes_iter = redis_command_byte;
       ++sizes_iter;
+
+      VContentAndTypeSizeResult VCATS_temp;
+      std::vector<std::vector<char>> buff_temp(total);
+
+      for (int i = 0; pk_raw != pk_raw_end;
+           ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
+        // Build full key: prefix:id
+        std::string full_key = prefix + separator;
+        if (std::is_same<K, tstring>::value) {
+          full_key += std::string(pk_raw->data(), pk_raw->size());
+        } else {
+          full_key += std::to_string(*pk_raw);
+        }
+        full_keys.push_back(full_key);
+
+        VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
+                                            V_byte_size, pv_raw, buff_temp[i]);
+
+        *ptrs_iter = full_keys.back().data();
+        ++ptrs_iter;
+        *ptrs_iter = VCATS_temp.VContentPointer;
+        ++ptrs_iter;
+
+        *sizes_iter = full_keys.back().size();
+        ++sizes_iter;
+        *sizes_iter = VCATS_temp.VTypeSize;
+        ++sizes_iter;
+      }
+
+      // Store full_keys in thread_context to keep strings alive
+      thread_context->full_keys_storage = std::move(full_keys);
+
+      assert(ptrs_0->front() == redis_command);
+      assert(sizes_0->front() == redis_command_byte);
+
+      auto cmd = [](::sw::redis::Connection &connection, const int argc,
+                    const std::vector<const char *> *ptrs_0,
+                    const std::vector<std::size_t> *sizes_0) {
+        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                        sizes_0->data());
+      };
+
+      try {
+        redis_conn_write->command(cmd, argc, ptrs_0, sizes_0);
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in MSET_COMMAND for MSET "
+                   << keys_prefix_name_slices[0] << " -- " << err.what();
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
+    } else {
+      // Large key mode: use HMSET (original implementation)
+      const int argc = total * 2 + 2;
+
+      const static char *redis_command = "HMSET";
+      const static std::size_t redis_command_byte = 5;
+
+      thread_context->HandleReserve(1U, argc, 0);
+
+      std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
+      std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
+
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
+
+      const std::size_t &&V_byte_size = Velems_per_dim0 * sizeof(V);
+
+      const V *pv_raw = values + begin * Velems_per_dim0;
+
+      auto ptrs_iter = ptrs_0->begin();
+      *ptrs_iter = redis_command;
+      ++ptrs_iter;
+      *ptrs_iter = keys_prefix_name_slices[0].data();
+      ++ptrs_iter;
+
+      auto sizes_iter = sizes_0->begin();
+      *sizes_iter = redis_command_byte;
+      ++sizes_iter;
+      *sizes_iter = keys_prefix_name_slices[0].size();
+      ++sizes_iter;
+
+      VContentAndTypeSizeResult VCATS_temp;
+      // std::vector<char> for storage all string in one KV pair
+      std::vector<std::vector<char>> buff_temp(total);
+
+      for (int i = 0; pk_raw != pk_raw_end;
+           ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
+        VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
+                                            V_byte_size, pv_raw, buff_temp[i]);
+
+        *ptrs_iter = KContentPointer<K>(
+            pk_raw);  // Direct access to Tensor data in TensorFlow
+        *(++ptrs_iter) = VCATS_temp.VContentPointer;
+        ++ptrs_iter;
+
+        *sizes_iter = KTypeSize<K>(pk_raw);  // key data char size
+        *(++sizes_iter) = VCATS_temp.VTypeSize;
+        ++sizes_iter;
+      }
+
+      assert(ptrs_0->front() == redis_command);
+      assert(sizes_0->front() == redis_command_byte);
+
+      auto cmd = [](::sw::redis::Connection &connection, const int argc,
+                    const std::vector<const char *> *ptrs_0,
+                    const std::vector<std::size_t> *sizes_0) {
+        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                        sizes_0->data());
+      };
+
+      try {
+        redis_conn_write->command(cmd, argc, ptrs_0, sizes_0);
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in MSET_COMMAND for HMSET "
+                   << keys_prefix_name_slices[0] << " -- " << err.what();
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
     }
-
-    assert(ptrs_0->front() == redis_command);
-    assert(sizes_0->front() == redis_command_byte);
-
-    auto cmd = [](::sw::redis::Connection &connection, const int argc,
-                  const std::vector<const char *> *ptrs_0,
-                  const std::vector<std::size_t> *sizes_0) {
-      connection.send(argc, const_cast<const char **>(ptrs_0->data()),
-                      sizes_0->data());
-    };
-
-    try {
-      redis_conn_write->command(cmd, argc, ptrs_0, sizes_0);
-    } catch (const std::exception &err) {
-      LOG(ERROR) << "RedisHandler error in MSET_COMMAND for HMSET "
-                 << keys_prefix_name_slices[0] << " -- " << err.what();
-      return errors::Unknown(err.what());
-    }
-
-    return Status::OK();
   }
 
   virtual Status MaccumCommand(
@@ -1063,140 +1397,372 @@ every bucket has its own BucketContext for sending data---for locating reply-
       ThreadContext *thread_context, const int64_t begin, const int64_t max_i,
       const int64_t Velems_per_dim0, std::string &values_dtype_str,
       const std::vector<std::string> &keys_prefix_name_slices) override {
-    const int &&total = max_i - begin;
-    const int &&argc = total * 2 + 4;
+    const int total = max_i - begin;
+    
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: implement true accumulation using MGET + accumulate + MSET
+      // Step 1: Build full keys and use MGET to get old values
+      const std::string &prefix = keys_prefix_name_slices[0];
+      const char separator = ':';
+      
+      std::vector<std::string> full_keys;
+      full_keys.reserve(total);
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
+      
+      for (; pk_raw != pk_raw_end; ++pk_raw) {
+        std::string full_key = prefix + separator;
+        if (std::is_same<K, tstring>::value) {
+          full_key += std::string(pk_raw->data(), pk_raw->size());
+        } else {
+          full_key += std::to_string(*pk_raw);
+        }
+        full_keys.push_back(full_key);
+      }
+      
+      // Step 2: Use MGET to get old values
+      const int mget_argc = total + 1;
+      const static char *mget_command = "MGET";
+      const static std::size_t mget_command_byte = 4;
+      
+      thread_context->HandleReserve(1U, mget_argc, 0);
+      std::vector<const char *> *mget_ptrs = thread_context->buckets[0]->ptrs.get();
+      std::vector<std::size_t> *mget_sizes = thread_context->buckets[0]->sizes.get();
+      
+      auto mget_ptrs_iter = mget_ptrs->begin();
+      *mget_ptrs_iter = mget_command;
+      ++mget_ptrs_iter;
+      
+      auto mget_sizes_iter = mget_sizes->begin();
+      *mget_sizes_iter = mget_command_byte;
+      ++mget_sizes_iter;
+      
+      for (const auto &full_key : full_keys) {
+        *mget_ptrs_iter = full_key.data();
+        ++mget_ptrs_iter;
+        *mget_sizes_iter = full_key.size();
+        ++mget_sizes_iter;
+      }
+      
+      thread_context->full_keys_storage = full_keys;  // Keep strings alive
+      
+      auto mget_cmd = [](::sw::redis::Connection &connection, const int argc,
+                         const std::vector<const char *> *ptrs_0,
+                         const std::vector<std::size_t> *sizes_0) {
+        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                        sizes_0->data());
+      };
+      
+      std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> mget_reply;
+      try {
+        mget_reply = redis_conn_read->command(mget_cmd, mget_argc, mget_ptrs, mget_sizes);
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in MACCUM_COMMAND MGET (small key mode) "
+                   << keys_prefix_name_slices[0] << " -- " << err.what();
+        return errors::Unknown(err.what());
+      }
+      
+      // Step 3: Accumulate values in client side
+      const std::size_t V_byte_size = Velems_per_dim0 * sizeof(V);
+      const V *pv_raw = values_or_delta + begin * Velems_per_dim0;
+      const bool *pe_raw = exists + begin;
+      
+      // Prepare accumulated values for MSET
+      std::vector<std::vector<char>> accumulated_values(total);
+      VContentAndTypeSizeResult VCATS_temp;
+      
+      pk_raw = keys + begin;
+      for (int i = 0; i < total; ++i, ++pk_raw, pv_raw += Velems_per_dim0, ++pe_raw) {
+        V *accumulated_val = nullptr;
+        bool need_accumulate = *pe_raw;
+        
+        // Get old value from MGET reply
+        if (mget_reply && mget_reply->type == REDIS_REPLY_ARRAY && 
+            i < static_cast<int>(mget_reply->elements)) {
+          redisReply *old_val_reply = mget_reply->element[i];
+          if (old_val_reply->type == REDIS_REPLY_STRING && need_accumulate) {
+            // Old value exists and we need to accumulate
+            accumulated_values[i].resize(V_byte_size);
+            accumulated_val = reinterpret_cast<V*>(accumulated_values[i].data());
+            
+            // Copy old value
+            ReplyMemcpyToValTensor<V>(accumulated_val, old_val_reply->str, Velems_per_dim0);
+            
+            // Accumulate: old_value + delta
+            const V *delta = pv_raw;
+            for (int64_t j = 0; j < Velems_per_dim0; ++j) {
+              accumulated_val[j] += delta[j];
+            }
+          } else {
+            // No old value or exists=false, use new value directly
+            accumulated_values[i].resize(V_byte_size);
+            accumulated_val = reinterpret_cast<V*>(accumulated_values[i].data());
+            memcpy(accumulated_val, pv_raw, V_byte_size);
+          }
+        } else {
+          // No old value, use new value directly
+          accumulated_values[i].resize(V_byte_size);
+          accumulated_val = reinterpret_cast<V*>(accumulated_values[i].data());
+          memcpy(accumulated_val, pv_raw, V_byte_size);
+        }
+      }
+      
+      // Step 4: Use MSET to set accumulated values
+      const int mset_argc = total * 2 + 1;
+      const static char *mset_command = "MSET";
+      const static std::size_t mset_command_byte = 4;
+      
+      thread_context->HandleReserve(1U, mset_argc, 0);
+      std::vector<const char *> *mset_ptrs = thread_context->buckets[0]->ptrs.get();
+      std::vector<std::size_t> *mset_sizes = thread_context->buckets[0]->sizes.get();
+      
+      auto mset_ptrs_iter = mset_ptrs->begin();
+      *mset_ptrs_iter = mset_command;
+      ++mset_ptrs_iter;
+      
+      auto mset_sizes_iter = mset_sizes->begin();
+      *mset_sizes_iter = mset_command_byte;
+      ++mset_sizes_iter;
+      
+      for (int i = 0; i < total; ++i) {
+        *mset_ptrs_iter = full_keys[i].data();
+        ++mset_ptrs_iter;
+        *mset_ptrs_iter = accumulated_values[i].data();
+        ++mset_ptrs_iter;
+        
+        *mset_sizes_iter = full_keys[i].size();
+        ++mset_sizes_iter;
+        *mset_sizes_iter = V_byte_size;
+        ++mset_sizes_iter;
+      }
+      
+      // Store accumulated_values in thread_context to keep data alive
+      thread_context->accumulated_values_storage = std::move(accumulated_values);
+      
+      auto mset_cmd = [](::sw::redis::Connection &connection, const int argc,
+                         const std::vector<const char *> *ptrs_0,
+                         const std::vector<std::size_t> *sizes_0) {
+        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                        sizes_0->data());
+      };
+      
+      try {
+        redis_conn_write->command(mset_cmd, mset_argc, mset_ptrs, mset_sizes);
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in MACCUM_COMMAND MSET (small key mode) "
+                   << keys_prefix_name_slices[0] << " -- " << err.what();
+        return errors::Unknown(err.what());
+      }
 
-    const static char *redis_command = "HMACCUM";
-    const static std::size_t redis_command_byte = 7;
+      return Status::OK();
+    } else {
+      // Large key mode: use HMACCUM (original implementation)
+      const int argc = total * 2 + 4;
 
-    thread_context->HandleReserve(1U, argc, 0);
+      const static char *redis_command = "HMACCUM";
+      const static std::size_t redis_command_byte = 7;
 
-    std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
-    std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
+      thread_context->HandleReserve(1U, argc, 0);
 
-    const K *const pk_raw_end = keys + max_i;
-    const K *pk_raw = keys + begin;
+      std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
+      std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
 
-    const std::size_t &&V_byte_size = Velems_per_dim0 * sizeof(V);
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
 
-    const V *pv_raw = values_or_delta + begin * Velems_per_dim0;
+      const std::size_t &&V_byte_size = Velems_per_dim0 * sizeof(V);
 
-    auto ptrs_iter = ptrs_0->begin();
-    *ptrs_iter = redis_command;
-    ++ptrs_iter;
-    *ptrs_iter = keys_prefix_name_slices[0].data();
-    ++ptrs_iter;
-    *ptrs_iter = values_dtype_str.c_str();
-    ++ptrs_iter;
+      const V *pv_raw = values_or_delta + begin * Velems_per_dim0;
 
-    auto sizes_iter = sizes_0->begin();
-    *sizes_iter = redis_command_byte;
-    ++sizes_iter;
-    *sizes_iter = keys_prefix_name_slices[0].size();
-    ++sizes_iter;
-    *sizes_iter = values_dtype_str.size();
-    ++sizes_iter;
-
-    VContentAndTypeSizeResult VCATS_temp;
-    // std::vector<char> for storage all string in one KV pair
-    std::vector<std::vector<char>> buff_temp(total);
-
-    for (int i = 0; pk_raw != pk_raw_end;
-         ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
-      VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
-                                          V_byte_size, pv_raw, buff_temp[i]);
-
-      *ptrs_iter = KContentPointer<K>(
-          pk_raw);  // Direct access to Tensor data in TensorFlow
-      *(++ptrs_iter) = VCATS_temp.VContentPointer;
+      auto ptrs_iter = ptrs_0->begin();
+      *ptrs_iter = redis_command;
+      ++ptrs_iter;
+      *ptrs_iter = keys_prefix_name_slices[0].data();
+      ++ptrs_iter;
+      *ptrs_iter = values_dtype_str.c_str();
       ++ptrs_iter;
 
-      *sizes_iter = KTypeSize<K>(pk_raw);  // key data char size
-      *(++sizes_iter) = VCATS_temp.VTypeSize;
+      auto sizes_iter = sizes_0->begin();
+      *sizes_iter = redis_command_byte;
       ++sizes_iter;
+      *sizes_iter = keys_prefix_name_slices[0].size();
+      ++sizes_iter;
+      *sizes_iter = values_dtype_str.size();
+      ++sizes_iter;
+
+      VContentAndTypeSizeResult VCATS_temp;
+      // std::vector<char> for storage all string in one KV pair
+      std::vector<std::vector<char>> buff_temp(total);
+
+      for (int i = 0; pk_raw != pk_raw_end;
+           ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
+        VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
+                                            V_byte_size, pv_raw, buff_temp[i]);
+
+        *ptrs_iter = KContentPointer<K>(
+            pk_raw);  // Direct access to Tensor data in TensorFlow
+        *(++ptrs_iter) = VCATS_temp.VContentPointer;
+        ++ptrs_iter;
+
+        *sizes_iter = KTypeSize<K>(pk_raw);  // key data char size
+        *(++sizes_iter) = VCATS_temp.VTypeSize;
+        ++sizes_iter;
+      }
+
+      const bool *pe_raw = exists + begin;
+      *ptrs_iter = KContentPointer<bool>(pe_raw);
+      *sizes_iter = total * KTypeSize<bool>(pe_raw);
+
+      assert(ptrs_0->front() == redis_command);
+      assert(sizes_0->front() == redis_command_byte);
+
+      auto cmd = [](::sw::redis::Connection &connection, const int argc,
+                    const std::vector<const char *> *ptrs_0,
+                    const std::vector<std::size_t> *sizes_0) {
+        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                        sizes_0->data());
+      };
+
+      try {
+        redis_conn_write->command(cmd, argc, ptrs_0, sizes_0);
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in MACCUM_COMMAND for HMACCUM "
+                   << keys_prefix_name_slices[0] << " -- " << err.what();
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
     }
-
-    const bool *pe_raw = exists + begin;
-    *ptrs_iter = KContentPointer<bool>(pe_raw);
-    *sizes_iter = total * KTypeSize<bool>(pe_raw);
-
-    assert(ptrs_0->front() == redis_command);
-    assert(sizes_0->front() == redis_command_byte);
-
-    auto cmd = [](::sw::redis::Connection &connection, const int argc,
-                  const std::vector<const char *> *ptrs_0,
-                  const std::vector<std::size_t> *sizes_0) {
-      connection.send(argc, const_cast<const char **>(ptrs_0->data()),
-                      sizes_0->data());
-    };
-
-    try {
-      redis_conn_write->command(cmd, argc, ptrs_0, sizes_0);
-    } catch (const std::exception &err) {
-      LOG(ERROR) << "RedisHandler error in MACCUM_COMMAND for HMACCUM "
-                 << keys_prefix_name_slices[0] << " -- " << err.what();
-      return errors::Unknown(err.what());
-    }
-
-    return Status::OK();
   }
 
   virtual Status DelCommand(
       const K *keys, ThreadContext *thread_context, const int64_t begin,
       const int64_t max_i,
       const std::vector<std::string> &keys_prefix_name_slices) override {
-    const int argc = (max_i - begin) + 2;
+    const int total = max_i - begin;
+    
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use DEL with full keys (prefix:id)
+      const int argc = total + 1;
+      const static char *redis_command = "DEL";
+      const static std::size_t redis_command_byte = 3;
 
-    const static char *redis_command = "HDEL";
-    const static std::size_t redis_command_byte = 4;
+      thread_context->HandleReserve(1U, argc, 0);
 
-    thread_context->HandleReserve(1U, argc, 0);
+      std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
+      std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
 
-    std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
-    std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
 
-    const K *const pk_raw_end = keys + max_i;
-    const K *pk_raw = keys + begin;
+      // Store full key strings in thread context
+      std::vector<std::string> full_keys;
+      full_keys.reserve(total);
+      
+      const std::string &prefix = keys_prefix_name_slices[0];
+      const char separator = ':';
 
-    auto ptrs_iter = ptrs_0->begin();
-    *ptrs_iter = redis_command;
-    ++ptrs_iter;
-    *ptrs_iter = keys_prefix_name_slices[0].data();
-    ++ptrs_iter;
-
-    auto sizes_iter = sizes_0->begin();
-    *sizes_iter = redis_command_byte;
-    ++sizes_iter;
-    *sizes_iter = keys_prefix_name_slices[0].size();
-    ++sizes_iter;
-
-    for (; pk_raw != pk_raw_end; ++pk_raw) {
-      *ptrs_iter = KContentPointer<K>(
-          pk_raw);  // Direct access to Tensor data in TensorFlow
+      auto ptrs_iter = ptrs_0->begin();
+      *ptrs_iter = redis_command;
       ++ptrs_iter;
-      *sizes_iter = KTypeSize<K>(pk_raw);  // key data char size
+
+      auto sizes_iter = sizes_0->begin();
+      *sizes_iter = redis_command_byte;
       ++sizes_iter;
+
+      for (; pk_raw != pk_raw_end; ++pk_raw) {
+        // Build full key: prefix:id
+        std::string full_key = prefix + separator;
+        if (std::is_same<K, tstring>::value) {
+          full_key += std::string(pk_raw->data(), pk_raw->size());
+        } else {
+          full_key += std::to_string(*pk_raw);
+        }
+        full_keys.push_back(full_key);
+        
+        *ptrs_iter = full_keys.back().data();
+        ++ptrs_iter;
+        *sizes_iter = full_keys.back().size();
+        ++sizes_iter;
+      }
+
+      // Store full_keys in thread_context to keep strings alive
+      thread_context->full_keys_storage = std::move(full_keys);
+
+      assert(ptrs_0->front() == redis_command);
+      assert(sizes_0->front() == redis_command_byte);
+
+      auto cmd = [](::sw::redis::Connection &connection, const int argc,
+                    const std::vector<const char *> *ptrs_0,
+                    const std::vector<std::size_t> *sizes_0) {
+        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                        sizes_0->data());
+      };
+
+      try {
+        /*auto reply=*/redis_conn_write->command(cmd, argc, ptrs_0, sizes_0);
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in DEL_COMMAND for DEL "
+                   << keys_prefix_name_slices[0] << " -- " << err.what();
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
+    } else {
+      // Large key mode: use HDEL (original implementation)
+      const int argc = total + 2;
+
+      const static char *redis_command = "HDEL";
+      const static std::size_t redis_command_byte = 4;
+
+      thread_context->HandleReserve(1U, argc, 0);
+
+      std::vector<const char *> *ptrs_0 = thread_context->buckets[0]->ptrs.get();
+      std::vector<std::size_t> *sizes_0 = thread_context->buckets[0]->sizes.get();
+
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
+
+      auto ptrs_iter = ptrs_0->begin();
+      *ptrs_iter = redis_command;
+      ++ptrs_iter;
+      *ptrs_iter = keys_prefix_name_slices[0].data();
+      ++ptrs_iter;
+
+      auto sizes_iter = sizes_0->begin();
+      *sizes_iter = redis_command_byte;
+      ++sizes_iter;
+      *sizes_iter = keys_prefix_name_slices[0].size();
+      ++sizes_iter;
+
+      for (; pk_raw != pk_raw_end; ++pk_raw) {
+        *ptrs_iter = KContentPointer<K>(
+            pk_raw);  // Direct access to Tensor data in TensorFlow
+        ++ptrs_iter;
+        *sizes_iter = KTypeSize<K>(pk_raw);  // key data char size
+        ++sizes_iter;
+      }
+
+      assert(ptrs_0->front() == redis_command);
+      assert(sizes_0->front() == redis_command_byte);
+
+      auto cmd = [](::sw::redis::Connection &connection, const int argc,
+                    const std::vector<const char *> *ptrs_0,
+                    const std::vector<std::size_t> *sizes_0) {
+        connection.send(argc, const_cast<const char **>(ptrs_0->data()),
+                        sizes_0->data());
+      };
+
+      try {
+        /*auto reply=*/redis_conn_write->command(cmd, argc, ptrs_0, sizes_0);
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in DEL_COMMAND for HDEL "
+                   << keys_prefix_name_slices[0] << " -- " << err.what();
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
     }
-
-    assert(ptrs_0->front() == redis_command);
-    assert(sizes_0->front() == redis_command_byte);
-
-    auto cmd = [](::sw::redis::Connection &connection, const int argc,
-                  const std::vector<const char *> *ptrs_0,
-                  const std::vector<std::size_t> *sizes_0) {
-      connection.send(argc, const_cast<const char **>(ptrs_0->data()),
-                      sizes_0->data());
-    };
-
-    try {
-      /*auto reply=*/redis_conn_write->command(cmd, argc, ptrs_0, sizes_0);
-    } catch (const std::exception &err) {
-      LOG(ERROR) << "RedisHandler error in DEL_COMMAND for HDEL "
-                 << keys_prefix_name_slices[0] << " -- " << err.what();
-      return errors::Unknown(err.what());
-    }
-
-    return Status::OK();
   }
 };  // namespace redis_connection
 

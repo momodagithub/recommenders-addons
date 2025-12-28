@@ -165,6 +165,8 @@ class RedisTableConfig(object):
     "using_hash_storage_slice": False,
     "keys_sending_size": 1024,
     "using_md5_prefix_name": False,
+    "using_small_key": False,  # If True, each embedding id will have an independent key.
+                                # If False, use hash table (HMSET/HMGET) to store multiple ids in one key.
     "redis_hash_tags_hypodispersion": False,
     "model_tag_import": "test",
     "redis_hash_tags_import": [],

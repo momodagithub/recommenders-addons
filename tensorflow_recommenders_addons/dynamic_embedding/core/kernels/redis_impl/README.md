@@ -56,6 +56,7 @@ Below is an example of a JSON file, along with comments on the corresponding pro
           False,  // If True, IDs will be calculated hash(CRC32) value and then MOD to decide which bucket number they belong to. If False, only calculate the remainder.
       "keys_sending_size": 1024,  // Determines how many keys to send at a time for performance tuning
       "using_md5_prefix_name": False,  // 1=true, 0=false
+      "using_small_key": False,  // If True, each embedding id will have an independent key (using SET/GET). If False, use hash table (HMSET/HMGET) to store multiple ids in one key.
       "redis_hash_tags_hypodispersion":
           False,  // distribution of storag_slice will be hypodispersion in 16354 regardless cluster slot, but still depends on redis_hash_tags_import/runtime if they aren't empty.
       "model_tag_import": "test",  // model_tag_import for version and any other information from last time.

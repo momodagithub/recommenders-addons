@@ -427,71 +427,251 @@ class RedisWrapper<RedisInstance, K, V,
 
   virtual size_t TableSizeInBucket(
       const std::string &keys_prefix_name_slice) override {
-    const std::string command_string = "HLEN " + keys_prefix_name_slice;
-    auto cmd = [](::sw::redis::Connection &connection,
-                  ::sw::redis::StringView hkey,
-                  const char *str) { connection.send(str); };
-    std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
-    try {
-      reply = redis_conn_read->command(cmd, keys_prefix_name_slice,
-                                       command_string.data());
-    } catch (const std::exception &err) {
-      LOG(ERROR) << "RedisHandler error in TableSizeInBucket for slices "
-                 << keys_prefix_name_slice << " -- " << err.what();
-      throw(err);
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use SCAN to count keys matching prefix:*
+      size_t size = 0;
+      long long cursor = 0;
+      const std::string pattern = keys_prefix_name_slice + ":*";
+      
+      do {
+        std::string command_string = "SCAN " + std::to_string(cursor) + " MATCH " + pattern + " COUNT 1000";
+        auto cmd = [](::sw::redis::Connection &connection,
+                      ::sw::redis::StringView hkey,
+                      const char *str) { connection.send(str); };
+        std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
+        try {
+          reply = redis_conn_read->command(cmd, keys_prefix_name_slice,
+                                           command_string.data());
+        } catch (const std::exception &err) {
+          LOG(ERROR) << "RedisHandler error in TableSizeInBucket SCAN for slices "
+                     << keys_prefix_name_slice << " -- " << err.what();
+          break;
+        }
+        if (reply && reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2) {
+          if (reply->element[0]->type == REDIS_REPLY_STRING) {
+            cursor = std::atoll(reply->element[0]->str);
+          }
+          if (reply->element[1]->type == REDIS_REPLY_ARRAY) {
+            size += reply->element[1]->elements;
+          }
+        } else {
+          break;
+        }
+      } while (cursor != 0);
+      
+      return size;
+    } else {
+      // Large key mode: use HLEN (original implementation)
+      const std::string command_string = "HLEN " + keys_prefix_name_slice;
+      auto cmd = [](::sw::redis::Connection &connection,
+                    ::sw::redis::StringView hkey,
+                    const char *str) { connection.send(str); };
+      std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
+      try {
+        reply = redis_conn_read->command(cmd, keys_prefix_name_slice,
+                                         command_string.data());
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in TableSizeInBucket for slices "
+                   << keys_prefix_name_slice << " -- " << err.what();
+        throw(err);
+      }
+      size_t size = 0;
+      if (reply->type == REDIS_REPLY_INTEGER)  // #define REDIS_REPLY_STRING 1
+      {
+        size += reply->integer;  // decimal
+      }
+      return size;
     }
-    size_t size = 0;
-    if (reply->type == REDIS_REPLY_INTEGER)  // #define REDIS_REPLY_STRING 1
-    {
-      size += reply->integer;  // decimal
-    }
-    return size;
   }
 
   virtual Status RemoveHkeysInBuckets(
       const std::string &keys_prefix_name_slice) override {
-    // std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
-    std::string redis_command("DEL ");
-    std::string command_string = redis_command + keys_prefix_name_slice;
-    auto cmd = [](::sw::redis::Connection &connection,
-                  ::sw::redis::StringView hkey,
-                  const char *str) { connection.send(str); };
-    try {
-      /*reply=*/redis_conn_write->command(cmd, keys_prefix_name_slice,
-                                          command_string.data());
-    } catch (const std::exception &err) {
-      LOG(ERROR) << "RedisHandler error in RemoveHkeysInBuckets for slices "
-                 << keys_prefix_name_slice << " -- " << err.what();
-      return errors::Unknown(err.what());
-    }
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use SCAN + DEL to remove all keys matching prefix:*
+      const std::string pattern = keys_prefix_name_slice + ":*";
+      long long cursor = 0;
+      
+      do {
+        // First, scan for keys
+        std::string scan_command = "SCAN " + std::to_string(cursor) + " MATCH " + pattern + " COUNT 1000";
+        auto scan_cmd = [](::sw::redis::Connection &connection,
+                           ::sw::redis::StringView hkey,
+                           const char *str) { connection.send(str); };
+        std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> scan_reply;
+        try {
+          scan_reply = redis_conn_read->command(scan_cmd, keys_prefix_name_slice,
+                                                  scan_command.data());
+        } catch (const std::exception &err) {
+          LOG(ERROR) << "RedisHandler error in RemoveHkeysInBuckets SCAN for slices "
+                     << keys_prefix_name_slice << " -- " << err.what();
+          return errors::Unknown(err.what());
+        }
+        
+        if (!scan_reply || scan_reply->type != REDIS_REPLY_ARRAY || scan_reply->elements < 2) {
+          break;
+        }
+        
+        if (scan_reply->element[0]->type == REDIS_REPLY_STRING) {
+          cursor = std::atoll(scan_reply->element[0]->str);
+        }
+        
+        // Delete found keys in batches
+        if (scan_reply->element[1]->type == REDIS_REPLY_ARRAY && scan_reply->element[1]->elements > 0) {
+          for (size_t i = 0; i < scan_reply->element[1]->elements; ++i) {
+            if (scan_reply->element[1]->element[i]->type == REDIS_REPLY_STRING) {
+              std::string key_str(scan_reply->element[1]->element[i]->str,
+                                  scan_reply->element[1]->element[i]->len);
+              std::string del_command = "DEL " + key_str;
+              auto del_cmd = [](::sw::redis::Connection &connection,
+                                ::sw::redis::StringView hkey,
+                                const char *str) { connection.send(str); };
+              try {
+                redis_conn_write->command(del_cmd, key_str, del_command.data());
+              } catch (const std::exception &err) {
+                LOG(ERROR) << "RedisHandler error in RemoveHkeysInBuckets DEL for "
+                           << keys_prefix_name_slice << " -- " << err.what();
+                // Continue to try deleting remaining keys
+              }
+            }
+          }
+        }
+      } while (cursor != 0);
+      
+      return Status::OK();
+    } else {
+      // Large key mode: use DEL (original implementation)
+      std::string redis_command("DEL ");
+      std::string command_string = redis_command + keys_prefix_name_slice;
+      auto cmd = [](::sw::redis::Connection &connection,
+                    ::sw::redis::StringView hkey,
+                    const char *str) { connection.send(str); };
+      try {
+        /*reply=*/redis_conn_write->command(cmd, keys_prefix_name_slice,
+                                            command_string.data());
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in RemoveHkeysInBuckets for slices "
+                   << keys_prefix_name_slice << " -- " << err.what();
+        return errors::Unknown(err.what());
+      }
 
-    return Status::OK();
+      return Status::OK();
+    }
   }
 
   virtual std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>
   HscanGetKeysValsInBucket(const std::string &keys_prefix_name_slice,
-                           long long *cursor, const long long count) override {
-    std::string command_string = "HSCAN " + keys_prefix_name_slice + ' ' +
-                                 std::to_string(*cursor) + " COUNT " +
-                                 std::to_string(count);
-    auto cmd = [](::sw::redis::Connection &connection,
-                  ::sw::redis::StringView hkey,
-                  const char *str) { connection.send(str); };
-    std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
-    try {
-      reply = redis_conn_read->command(cmd, keys_prefix_name_slice,
-                                       command_string.data());
-    } catch (const std::exception &err) {
-      LOG(ERROR) << "RedisHandler error in HscanGetKeysValsInBucket for slices "
-                 << keys_prefix_name_slice << " -- " << err.what();
-    }
-    if (reply->element[0]->type == REDIS_REPLY_STRING) {
-      // #define REDIS_REPLY_STRING 1
-      *cursor = std::atoll(reply->element[0]->str);
+                           long long *cursor, const long long count,
+                           ThreadContext *thread_context = nullptr) override {
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use SCAN to get keys
+      const std::string pattern = keys_prefix_name_slice + ":*";
+      std::string command_string = "SCAN " + std::to_string(*cursor) + " MATCH " + pattern + " COUNT " + std::to_string(count);
+      auto cmd = [](::sw::redis::Connection &connection,
+                    ::sw::redis::StringView hkey,
+                    const char *str) { connection.send(str); };
+      std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
+      try {
+        reply = redis_conn_read->command(cmd, keys_prefix_name_slice,
+                                         command_string.data());
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in HscanGetKeysValsInBucket SCAN for slices "
+                   << keys_prefix_name_slice << " -- " << err.what();
+        return nullptr;
+      }
+      
+      if (reply && reply->type == REDIS_REPLY_ARRAY && reply->elements >= 2) {
+        if (reply->element[0]->type == REDIS_REPLY_STRING) {
+          *cursor = std::atoll(reply->element[0]->str);
+        }
+        
+        // For small key mode, we need to get values for each key using MGET
+        redisReply *keys_array = reply->element[1];
+        if (keys_array->type != REDIS_REPLY_ARRAY || keys_array->elements == 0) {
+          // No keys found, return empty result
+          return reply;
+        }
+        
+        // Build MGET command to get values for all keys
+        const int key_count = keys_array->elements;
+        const int mget_argc = key_count + 1;
+        const static char *mget_command = "MGET";
+        const static std::size_t mget_command_byte = 4;
+        
+        // Prepare MGET command arguments
+        std::vector<const char*> mget_argv(mget_argc);
+        std::vector<size_t> mget_argvlen(mget_argc);
+        mget_argv[0] = mget_command;
+        mget_argvlen[0] = mget_command_byte;
+        
+        for (int i = 0; i < key_count; ++i) {
+          if (keys_array->element[i]->type == REDIS_REPLY_STRING) {
+            mget_argv[i + 1] = keys_array->element[i]->str;
+            mget_argvlen[i + 1] = keys_array->element[i]->len;
+          }
+        }
+        
+        // Execute MGET (for cluster mode, keys should be on the same node due to SCAN pattern)
+        auto mget_cmd = [&mget_argv, &mget_argvlen](::sw::redis::Connection &connection,
+                                                     const ::sw::redis::StringView &hkey) {
+          connection.send(static_cast<int>(mget_argv.size()),
+                         const_cast<const char **>(mget_argv.data()),
+                         mget_argvlen.data());
+        };
+        
+        std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> mget_reply;
+        try {
+          // Use the first key to determine which node to query
+          if (keys_array->element[0]->type == REDIS_REPLY_STRING) {
+            std::string first_key(keys_array->element[0]->str, keys_array->element[0]->len);
+            mget_reply = redis_conn_read->command(mget_cmd, first_key);
+          }
+        } catch (const std::exception &err) {
+          LOG(ERROR) << "RedisHandler error in HscanGetKeysValsInBucket MGET (cluster mode) for slices "
+                     << keys_prefix_name_slice << " -- " << err.what();
+          return nullptr;
+        }
+        
+        if (!mget_reply || mget_reply->type != REDIS_REPLY_ARRAY) {
+          LOG(ERROR) << "Invalid MGET reply in HscanGetKeysValsInBucket (cluster mode) for slices "
+                     << keys_prefix_name_slice;
+          return nullptr;
+        }
+        
+        // Store MGET reply in ThreadContext for ExportValuesToTensor to use
+        if (thread_context) {
+          thread_context->mget_reply_storage = std::move(mget_reply);
+        }
+        
+        // Return SCAN reply (with keys only)
+        // ExportValuesToTensor will use the stored MGET reply to get values
+        return reply;
+      } else {
+        return nullptr;
+      }
     } else {
-      return nullptr;
+      // Large key mode: use HSCAN (original implementation)
+      std::string command_string = "HSCAN " + keys_prefix_name_slice + ' ' +
+                                   std::to_string(*cursor) + " COUNT " +
+                                   std::to_string(count);
+      auto cmd = [](::sw::redis::Connection &connection,
+                    ::sw::redis::StringView hkey,
+                    const char *str) { connection.send(str); };
+      std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> reply;
+      try {
+        reply = redis_conn_read->command(cmd, keys_prefix_name_slice,
+                                         command_string.data());
+      } catch (const std::exception &err) {
+        LOG(ERROR) << "RedisHandler error in HscanGetKeysValsInBucket for slices "
+                   << keys_prefix_name_slice << " -- " << err.what();
+      }
+      if (reply && reply->element[0]->type == REDIS_REPLY_STRING) {
+        // #define REDIS_REPLY_STRING 1
+        *cursor = std::atoll(reply->element[0]->str);
+      } else {
+        return nullptr;
+      }
+      return reply;
     }
-    return reply;
   }
 
   virtual std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter> MgetInBucket(
@@ -938,79 +1118,173 @@ every bucket has its own BucketContext for sending data---for locating reply-
       const K *keys, ThreadContext *thread_context, const int64_t begin,
       const int64_t max_i,
       const std::vector<std::string> &keys_prefix_name_slices) override {
-    const int &&total = max_i - begin;
-    const int &&argc = total + 2;
+    const int total = max_i - begin;
+    
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use MGET with full keys (prefix:id)
+      const int argc = total + 1;
+      const static char *redis_command = "MGET";
+      const static std::size_t redis_command_byte = 4;
 
-    const static char *redis_command = "HMGET";
-    const static std::size_t &&redis_command_byte = 5;
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
 
-    const K *const pk_raw_end = keys + max_i;
-    const K *pk_raw = keys + begin;
+      const unsigned &storage_slice = this->redis_connection_params.storage_slice;
+      const unsigned &&vector_len =
+          (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
+           this->redis_connection_params.storage_slice) +
+          1;
 
-    const unsigned &storage_slice = this->redis_connection_params.storage_slice;
-    const unsigned &&vector_len =
-        (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
-         this->redis_connection_params.storage_slice) +
-        2;
+      thread_context->HandleReserve(storage_slice, vector_len, total);
 
-    thread_context->HandleReserve(storage_slice, vector_len, total);
+      // Store full key strings in thread context
+      std::vector<std::string> full_keys;
+      full_keys.reserve(total);
+      
+      const char separator = ':';
 
-    for (unsigned i = 0; i < storage_slice; ++i) {
-      thread_context->HandlePushBack(i, redis_command, redis_command_byte);
-      thread_context->HandlePushBack(i, keys_prefix_name_slices[i].data(),
-                                     keys_prefix_name_slices[i].size());
-    }
+      unsigned *pbucket_loc = thread_context->bucket_locs->data();
+      unsigned key_bucket_locs = 0;
+      
+      for (; pk_raw != pk_raw_end; ++pk_raw) {
+        // Build full key: prefix:id, where prefix is determined by bucket
+        // First determine bucket based on original key
+        key_bucket_locs =
+            KBucketNum<K>(this->K_bucket_num_handle, pk_raw, storage_slice);
+        *pbucket_loc = key_bucket_locs;
+        ++pbucket_loc;
 
-    unsigned *pbucket_loc = thread_context->bucket_locs->data();
-    unsigned key_bucket_locs = 0;
-    for (; pk_raw != pk_raw_end; ++pk_raw) {
-      key_bucket_locs =
-          KBucketNum<K>(this->K_bucket_num_handle, pk_raw, storage_slice);
-      // The bucket to which the key belongs is recorded to facilitate future
-      // memory writes that do not recompute the redis hash
-      *pbucket_loc = key_bucket_locs;
-      ++pbucket_loc;
+        const std::string &prefix = keys_prefix_name_slices[key_bucket_locs];
+        std::string full_key = prefix + separator;
+        if (std::is_same<K, tstring>::value) {
+          full_key += std::string(pk_raw->data(), pk_raw->size());
+        } else {
+          full_key += std::to_string(*pk_raw);
+        }
+        full_keys.push_back(full_key);
 
-      // Direct access to Tensor data in TensorFlow
-      thread_context->HandlePushBack(
-          key_bucket_locs, KContentPointer<K>(pk_raw), KTypeSize<K>(pk_raw));
-    }
-
-    auto cmd = [](::sw::redis::Connection &connection,
-                  const ::sw::redis::StringView hkey,
-                  const std::vector<const char *> *ptrs_i,
-                  const std::vector<std::size_t> *sizes_i) {
-      assert(strcmp(ptrs_i->front(), "HMGET") == 0);
-      assert(sizes_i->front() == 5);
-      assert(std::string(hkey.data()).compare(ptrs_i[1]) == 0);
-
-      connection.send(static_cast<int>(ptrs_i->size()),
-                      const_cast<const char **>(ptrs_i->data()),
-                      sizes_i->data());
-    };
-
-    std::vector<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>> replies(
-        storage_slice);
-    std::vector<
-        std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
-        results;
-    for (unsigned i = 0; i < storage_slice; ++i) {
-      replies[i] = std::move(nullptr);
-    }
-    try {
-      for (unsigned i = 0; i < storage_slice; ++i) {
-        results.emplace_back(
-            network_worker_pool->enqueue([this, &cmd, thread_context, i] {
-              return PipeExecRead(cmd, 3U, thread_context->buckets[i]);
-            }));
+        // Direct access to Tensor data in TensorFlow
+        thread_context->HandlePushBack(
+            key_bucket_locs, full_keys.back().data(), full_keys.back().size());
       }
+
+      // Store full_keys in thread_context to keep strings alive
+      thread_context->full_keys_storage = std::move(full_keys);
+
+      // Push command for each bucket
       for (unsigned i = 0; i < storage_slice; ++i) {
-        replies[i] = std::move(results[i].get());
+        thread_context->HandlePushBack(i, redis_command, redis_command_byte);
       }
-    } catch (const std::exception &err) {
+
+      auto cmd = [](::sw::redis::Connection &connection,
+                    const ::sw::redis::StringView hkey,
+                    const std::vector<const char *> *ptrs_i,
+                    const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "MGET") == 0);
+        assert(sizes_i->front() == 4);
+
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+
+      std::vector<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>> replies(
+          storage_slice);
+      std::vector<
+          std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
+          results;
+      for (unsigned i = 0; i < storage_slice; ++i) {
+        replies[i] = std::move(nullptr);
+      }
+      try {
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          results.emplace_back(
+              network_worker_pool->enqueue([this, &cmd, thread_context, i] {
+                return PipeExecRead(cmd, 3U, thread_context->buckets[i]);
+              }));
+        }
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          replies[i] = std::move(results[i].get());
+        }
+      } catch (const std::exception &err) {
+        return replies;
+      }
+      return replies;
+    } else {
+      // Large key mode: use HMGET (original implementation)
+      const int argc = total + 2;
+
+      const static char *redis_command = "HMGET";
+      const static std::size_t &&redis_command_byte = 5;
+
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
+
+      const unsigned &storage_slice = this->redis_connection_params.storage_slice;
+      const unsigned &&vector_len =
+          (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
+           this->redis_connection_params.storage_slice) +
+          2;
+
+      thread_context->HandleReserve(storage_slice, vector_len, total);
+
+      for (unsigned i = 0; i < storage_slice; ++i) {
+        thread_context->HandlePushBack(i, redis_command, redis_command_byte);
+        thread_context->HandlePushBack(i, keys_prefix_name_slices[i].data(),
+                                       keys_prefix_name_slices[i].size());
+      }
+
+      unsigned *pbucket_loc = thread_context->bucket_locs->data();
+      unsigned key_bucket_locs = 0;
+      for (; pk_raw != pk_raw_end; ++pk_raw) {
+        key_bucket_locs =
+            KBucketNum<K>(this->K_bucket_num_handle, pk_raw, storage_slice);
+        // The bucket to which the key belongs is recorded to facilitate future
+        // memory writes that do not recompute the redis hash
+        *pbucket_loc = key_bucket_locs;
+        ++pbucket_loc;
+
+        // Direct access to Tensor data in TensorFlow
+        thread_context->HandlePushBack(
+            key_bucket_locs, KContentPointer<K>(pk_raw), KTypeSize<K>(pk_raw));
+      }
+
+      auto cmd = [](::sw::redis::Connection &connection,
+                    const ::sw::redis::StringView hkey,
+                    const std::vector<const char *> *ptrs_i,
+                    const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "HMGET") == 0);
+        assert(sizes_i->front() == 5);
+        assert(std::string(hkey.data()).compare(ptrs_i[1]) == 0);
+
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+
+      std::vector<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>> replies(
+          storage_slice);
+      std::vector<
+          std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
+          results;
+      for (unsigned i = 0; i < storage_slice; ++i) {
+        replies[i] = std::move(nullptr);
+      }
+      try {
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          results.emplace_back(
+              network_worker_pool->enqueue([this, &cmd, thread_context, i] {
+                return PipeExecRead(cmd, 3U, thread_context->buckets[i]);
+              }));
+        }
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          replies[i] = std::move(results[i].get());
+        }
+      } catch (const std::exception &err) {
+        return replies;
+      }
       return replies;
     }
-    return replies;
   }
 
   inline void CopyDefaultToTensor(const bool is_full_default, const V *pv_raw,
@@ -1145,87 +1419,188 @@ every bucket has its own BucketContext for sending data---for locating reply-
       const K *keys, const V *values, ThreadContext *thread_context,
       const int64_t begin, const int64_t max_i, const int64_t Velems_per_dim0,
       const std::vector<std::string> &keys_prefix_name_slices) override {
-    const int &&total = max_i - begin;
-    const int &&argc = total * 2 + 2;
+    const int total = max_i - begin;
+    
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use MSET with full keys (prefix:id)
+      const int argc = total * 2 + 1;
+      const static char *redis_command = "MSET";
+      const static std::size_t redis_command_byte = 4;
 
-    const static char *redis_command = "HMSET";
-    const static std::size_t &&redis_command_byte = 5;
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
 
-    const K *const pk_raw_end = keys + max_i;
-    const K *pk_raw = keys + begin;
+      const std::size_t V_byte_size = Velems_per_dim0 * sizeof(V);
+      const V *pv_raw = values + begin * Velems_per_dim0;
 
-    const std::size_t &&V_byte_size = Velems_per_dim0 * sizeof(V);
+      const unsigned &storage_slice = this->redis_connection_params.storage_slice;
+      const unsigned &&vector_len =
+          (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
+           this->redis_connection_params.storage_slice) +
+          1;
 
-    const V *pv_raw = values + begin * Velems_per_dim0;
+      thread_context->HandleReserve(storage_slice, vector_len, total);
 
-    const unsigned &storage_slice = this->redis_connection_params.storage_slice;
-    const unsigned &&vector_len =
-        (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
-         this->redis_connection_params.storage_slice) +
-        2;
+      // Store full key strings in thread context
+      std::vector<std::string> full_keys;
+      full_keys.reserve(total);
+      
+      const char separator = ':';
 
-    thread_context->HandleReserve(storage_slice, vector_len, total);
-
-    for (unsigned i = 0; i < storage_slice; ++i) {
-      thread_context->HandlePushBack(i, redis_command, redis_command_byte);
-      thread_context->HandlePushBack(i, keys_prefix_name_slices[i].data(),
-                                     keys_prefix_name_slices[i].size());
-    }
-
-    VContentAndTypeSizeResult VCATS_temp;
-    // std::vector<char> for storage all string in one KV pair
-    std::vector<std::vector<char>> buff_temp(total);
-    unsigned key_bucket_locs = 0;
-    for (int i = 0; pk_raw != pk_raw_end;
-         ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
-      VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
-                                          V_byte_size, pv_raw, buff_temp[i]);
-      key_bucket_locs =
-          KBucketNum<K>(this->K_bucket_num_handle, pk_raw,
-                        storage_slice);  // TODO: change it to AVX512
-
-      // Direct access to Tensor data in TensorFlow
-      thread_context->HandlePushBack(
-          key_bucket_locs, KContentPointer<K>(pk_raw), KTypeSize<K>(pk_raw));
-      thread_context->HandlePushBack(
-          key_bucket_locs, VCATS_temp.VContentPointer, VCATS_temp.VTypeSize);
-    }
-
-    auto cmd = [](::sw::redis::Connection &connection,
-                  const ::sw::redis::StringView &hkey,
-                  const std::vector<const char *> *ptrs_i,
-                  const std::vector<std::size_t> *sizes_i) {
-      assert(strcmp(ptrs_i->front(), "HMSET") == 0);
-      assert(sizes_i->front() == 5);
-      assert(std::string(hkey.data()).compare(ptrs_i[1]) == 0);
-
-      connection.send(static_cast<int>(ptrs_i->size()),
-                      const_cast<const char **>(ptrs_i->data()),
-                      sizes_i->data());
-    };
-
-    std::vector<
-        std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
-        results;
-    try {
+      // Push command for each bucket first
       for (unsigned i = 0; i < storage_slice; ++i) {
-        results.emplace_back(
-            network_worker_pool->enqueue([this, &cmd, thread_context, i] {
-              return PipeExecWrite(cmd, 4U, thread_context->buckets[i]);
-            }));
+        thread_context->HandlePushBack(i, redis_command, redis_command_byte);
       }
-      for (auto &&result : results) {
-        result.wait();
-      }
-      if (error_ptr) {
-        std::rethrow_exception(error_ptr);
-      }
-    } catch (const std::exception &err) {
-      error_ptr = nullptr;
-      return errors::Unknown(err.what());
-    }
 
-    return Status::OK();
+      VContentAndTypeSizeResult VCATS_temp;
+      std::vector<std::vector<char>> buff_temp(total);
+      unsigned key_bucket_locs = 0;
+      
+      for (int i = 0; pk_raw != pk_raw_end;
+           ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
+        VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
+                                            V_byte_size, pv_raw, buff_temp[i]);
+        key_bucket_locs =
+            KBucketNum<K>(this->K_bucket_num_handle, pk_raw,
+                          storage_slice);
+
+        // Build full key: prefix:id
+        const std::string &prefix = keys_prefix_name_slices[key_bucket_locs];
+        std::string full_key = prefix + separator;
+        if (std::is_same<K, tstring>::value) {
+          full_key += std::string(pk_raw->data(), pk_raw->size());
+        } else {
+          full_key += std::to_string(*pk_raw);
+        }
+        full_keys.push_back(full_key);
+
+        // Direct access to Tensor data in TensorFlow
+        thread_context->HandlePushBack(
+            key_bucket_locs, full_keys.back().data(), full_keys.back().size());
+        thread_context->HandlePushBack(
+            key_bucket_locs, VCATS_temp.VContentPointer, VCATS_temp.VTypeSize);
+      }
+
+      // Store full_keys in thread_context to keep strings alive
+      thread_context->full_keys_storage = std::move(full_keys);
+
+      auto cmd = [](::sw::redis::Connection &connection,
+                    const ::sw::redis::StringView &hkey,
+                    const std::vector<const char *> *ptrs_i,
+                    const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "MSET") == 0);
+        assert(sizes_i->front() == 4);
+
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+
+      std::vector<
+          std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
+          results;
+      try {
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          results.emplace_back(
+              network_worker_pool->enqueue([this, &cmd, thread_context, i] {
+                return PipeExecWrite(cmd, 4U, thread_context->buckets[i]);
+              }));
+        }
+        for (auto &&result : results) {
+          result.wait();
+        }
+        if (error_ptr) {
+          std::rethrow_exception(error_ptr);
+        }
+      } catch (const std::exception &err) {
+        error_ptr = nullptr;
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
+    } else {
+      // Large key mode: use HMSET (original implementation)
+      const int argc = total * 2 + 2;
+
+      const static char *redis_command = "HMSET";
+      const static std::size_t &&redis_command_byte = 5;
+
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
+
+      const std::size_t &&V_byte_size = Velems_per_dim0 * sizeof(V);
+
+      const V *pv_raw = values + begin * Velems_per_dim0;
+
+      const unsigned &storage_slice = this->redis_connection_params.storage_slice;
+      const unsigned &&vector_len =
+          (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
+           this->redis_connection_params.storage_slice) +
+          2;
+
+      thread_context->HandleReserve(storage_slice, vector_len, total);
+
+      for (unsigned i = 0; i < storage_slice; ++i) {
+        thread_context->HandlePushBack(i, redis_command, redis_command_byte);
+        thread_context->HandlePushBack(i, keys_prefix_name_slices[i].data(),
+                                       keys_prefix_name_slices[i].size());
+      }
+
+      VContentAndTypeSizeResult VCATS_temp;
+      // std::vector<char> for storage all string in one KV pair
+      std::vector<std::vector<char>> buff_temp(total);
+      unsigned key_bucket_locs = 0;
+      for (int i = 0; pk_raw != pk_raw_end;
+           ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
+        VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
+                                            V_byte_size, pv_raw, buff_temp[i]);
+        key_bucket_locs =
+            KBucketNum<K>(this->K_bucket_num_handle, pk_raw,
+                          storage_slice);  // TODO: change it to AVX512
+
+        // Direct access to Tensor data in TensorFlow
+        thread_context->HandlePushBack(
+            key_bucket_locs, KContentPointer<K>(pk_raw), KTypeSize<K>(pk_raw));
+        thread_context->HandlePushBack(
+            key_bucket_locs, VCATS_temp.VContentPointer, VCATS_temp.VTypeSize);
+      }
+
+      auto cmd = [](::sw::redis::Connection &connection,
+                    const ::sw::redis::StringView &hkey,
+                    const std::vector<const char *> *ptrs_i,
+                    const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "HMSET") == 0);
+        assert(sizes_i->front() == 5);
+        assert(std::string(hkey.data()).compare(ptrs_i[1]) == 0);
+
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+
+      std::vector<
+          std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
+          results;
+      try {
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          results.emplace_back(
+              network_worker_pool->enqueue([this, &cmd, thread_context, i] {
+                return PipeExecWrite(cmd, 4U, thread_context->buckets[i]);
+              }));
+        }
+        for (auto &&result : results) {
+          result.wait();
+        }
+        if (error_ptr) {
+          std::rethrow_exception(error_ptr);
+        }
+      } catch (const std::exception &err) {
+        error_ptr = nullptr;
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
+    }
   }
 
   virtual Status MaccumCommand(
@@ -1233,175 +1608,465 @@ every bucket has its own BucketContext for sending data---for locating reply-
       ThreadContext *thread_context, const int64_t begin, const int64_t max_i,
       const int64_t Velems_per_dim0, std::string &values_dtype_str,
       const std::vector<std::string> &keys_prefix_name_slices) override {
-    const int &&total = max_i - begin;
-    const int &&argc = total * 2 + 4;
-
-    const static char *redis_command = "HMACCUM";
-    const static std::size_t &&redis_command_byte = 7;
-    size_t dtype_str_size = values_dtype_str.size();
-
-    const K *const pk_raw_end = keys + max_i;
-    const K *pk_raw = keys + begin;
-
-    const std::size_t &&V_byte_size = Velems_per_dim0 * sizeof(V);
-
-    const V *pv_raw = values_or_delta + begin * Velems_per_dim0;
-
-    const unsigned &storage_slice = this->redis_connection_params.storage_slice;
-    const unsigned &&vector_len =
-        (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
-         this->redis_connection_params.storage_slice) +
-        4;
-
-    thread_context->HandleReserve(storage_slice, vector_len, total);
-
-    for (unsigned i = 0; i < storage_slice; ++i) {
-      thread_context->HandlePushBack(i, redis_command, redis_command_byte);
-      thread_context->HandlePushBack(i, keys_prefix_name_slices[i].data(),
-                                     keys_prefix_name_slices[i].size());
-      thread_context->HandlePushBack(i, values_dtype_str.c_str(),
-                                     dtype_str_size);
-    }
-
-    VContentAndTypeSizeResult VCATS_temp;
-    // std::vector<char> for storage all string in one KV pair
-    std::vector<std::vector<char>> buff_temp(total);
-    unsigned key_bucket_locs = 0;
-    for (int i = 0; pk_raw != pk_raw_end;
-         ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
-      VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
-                                          V_byte_size, pv_raw, buff_temp[i]);
-      key_bucket_locs =
-          KBucketNum<K>(this->K_bucket_num_handle, pk_raw,
-                        storage_slice);  // TODO: change it to AVX512
-
-      // Direct access to Tensor data in TensorFlow
-      thread_context->HandlePushBack(
-          key_bucket_locs, KContentPointer<K>(pk_raw), KTypeSize<K>(pk_raw));
-      thread_context->HandlePushBack(
-          key_bucket_locs, VCATS_temp.VContentPointer, VCATS_temp.VTypeSize);
-    }
-
-    const bool *pe_raw = exists + begin;
-    for (unsigned i = 0; i < storage_slice; ++i) {
-      thread_context->HandlePushBack(i, KContentPointer<bool>(pe_raw),
-                                     total * KTypeSize<bool>(pe_raw));
-    }
-
-    auto cmd = [](::sw::redis::Connection &connection,
-                  const ::sw::redis::StringView &hkey,
-                  const std::vector<const char *> *ptrs_i,
-                  const std::vector<std::size_t> *sizes_i) {
-      assert(strcmp(ptrs_i->front(), "HMACCUM") == 0);
-      assert(sizes_i->front() == redis_command_byte);
-      assert(std::string(hkey.data()).compare(ptrs_i[1]) == 0);
-
-      connection.send(static_cast<int>(ptrs_i->size()),
-                      const_cast<const char **>(ptrs_i->data()),
-                      sizes_i->data());
-    };
-
-    std::vector<
-        std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
-        results;
-    try {
+    const int total = max_i - begin;
+    
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: implement true accumulation using MGET + accumulate + MSET
+      // Step 1: Build full keys and group by bucket
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
+      const std::size_t V_byte_size = Velems_per_dim0 * sizeof(V);
+      const V *pv_raw = values_or_delta + begin * Velems_per_dim0;
+      const bool *pe_raw = exists + begin;
+      const unsigned &storage_slice = this->redis_connection_params.storage_slice;
+      const char separator = ':';
+      
+      std::vector<std::string> full_keys;
+      std::vector<unsigned> key_bucket_indices;
+      std::vector<std::vector<int>> bucket_key_indices(storage_slice);  // Track which keys belong to each bucket
+      full_keys.reserve(total);
+      key_bucket_indices.reserve(total);
+      
+      // Build full keys and determine buckets
+      for (int i = 0; pk_raw != pk_raw_end; ++i, ++pk_raw) {
+        unsigned key_bucket_locs = KBucketNum<K>(this->K_bucket_num_handle, pk_raw, storage_slice);
+        key_bucket_indices.push_back(key_bucket_locs);
+        
+        const std::string &prefix = keys_prefix_name_slices[key_bucket_locs];
+        std::string full_key = prefix + separator;
+        if (std::is_same<K, tstring>::value) {
+          full_key += std::string(pk_raw->data(), pk_raw->size());
+        } else {
+          full_key += std::to_string(*pk_raw);
+        }
+        full_keys.push_back(full_key);
+        bucket_key_indices[key_bucket_locs].push_back(i);
+      }
+      
+      thread_context->full_keys_storage = full_keys;  // Keep strings alive
+      
+      // Step 2: For each bucket, use MGET to get old values
+      std::vector<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>> mget_replies(storage_slice);
+      for (unsigned bucket = 0; bucket < storage_slice; ++bucket) {
+        if (bucket_key_indices[bucket].empty()) {
+          mget_replies[bucket] = nullptr;
+          continue;
+        }
+        
+        const int mget_argc = bucket_key_indices[bucket].size() + 1;
+        const static char *mget_command = "MGET";
+        const static std::size_t mget_command_byte = 4;
+        
+        thread_context->HandleReserve(storage_slice, mget_argc, total);
+        std::vector<const char *> *mget_ptrs = thread_context->buckets[bucket]->ptrs.get();
+        std::vector<std::size_t> *mget_sizes = thread_context->buckets[bucket]->sizes.get();
+        
+        auto mget_ptrs_iter = mget_ptrs->begin();
+        *mget_ptrs_iter = mget_command;
+        ++mget_ptrs_iter;
+        
+        auto mget_sizes_iter = mget_sizes->begin();
+        *mget_sizes_iter = mget_command_byte;
+        ++mget_sizes_iter;
+        
+        for (int key_idx : bucket_key_indices[bucket]) {
+          *mget_ptrs_iter = full_keys[key_idx].data();
+          ++mget_ptrs_iter;
+          *mget_sizes_iter = full_keys[key_idx].size();
+          ++mget_sizes_iter;
+        }
+        
+        auto mget_cmd = [](::sw::redis::Connection &connection,
+                           const ::sw::redis::StringView hkey,
+                           const std::vector<const char *> *ptrs_i,
+                           const std::vector<std::size_t> *sizes_i) {
+          assert(strcmp(ptrs_i->front(), "MGET") == 0);
+          assert(sizes_i->front() == 4);
+          connection.send(static_cast<int>(ptrs_i->size()),
+                          const_cast<const char **>(ptrs_i->data()),
+                          sizes_i->data());
+        };
+        
+        try {
+          mget_replies[bucket] = PipeExecRead(mget_cmd, 3U, thread_context->buckets[bucket]);
+        } catch (const std::exception &err) {
+          LOG(ERROR) << "RedisHandler error in MACCUM_COMMAND MGET (small key mode, bucket " << bucket << ") "
+                     << keys_prefix_name_slices[bucket] << " -- " << err.what();
+          mget_replies[bucket] = nullptr;
+        }
+      }
+      
+      // Step 3: Accumulate values in client side
+      std::vector<std::vector<char>> accumulated_values(total);
+      pk_raw = keys + begin;
+      pv_raw = values_or_delta + begin * Velems_per_dim0;
+      pe_raw = exists + begin;
+      
+      for (int i = 0; i < total; ++i, ++pk_raw, pv_raw += Velems_per_dim0, ++pe_raw) {
+        unsigned bucket = key_bucket_indices[i];
+        bool need_accumulate = *pe_raw;
+        
+        accumulated_values[i].resize(V_byte_size);
+        V *accumulated_val = reinterpret_cast<V*>(accumulated_values[i].data());
+        
+        // Find this key's index within its bucket
+        int bucket_key_idx = -1;
+        for (size_t j = 0; j < bucket_key_indices[bucket].size(); ++j) {
+          if (bucket_key_indices[bucket][j] == i) {
+            bucket_key_idx = j;
+            break;
+          }
+        }
+        
+        // Get old value from MGET reply
+        if (bucket_key_idx >= 0 && mget_replies[bucket] && 
+            mget_replies[bucket]->type == REDIS_REPLY_ARRAY &&
+            bucket_key_idx < static_cast<int>(mget_replies[bucket]->elements)) {
+          redisReply *old_val_reply = mget_replies[bucket]->element[bucket_key_idx];
+          if (old_val_reply->type == REDIS_REPLY_STRING && need_accumulate) {
+            // Old value exists and we need to accumulate
+            ReplyMemcpyToValTensor<V>(accumulated_val, old_val_reply->str, Velems_per_dim0);
+            // Accumulate: old_value + delta
+            const V *delta = pv_raw;
+            for (int64_t j = 0; j < Velems_per_dim0; ++j) {
+              accumulated_val[j] += delta[j];
+            }
+          } else {
+            // No old value or exists=false, use new value directly
+            memcpy(accumulated_val, pv_raw, V_byte_size);
+          }
+        } else {
+          // No old value, use new value directly
+          memcpy(accumulated_val, pv_raw, V_byte_size);
+        }
+      }
+      
+      thread_context->accumulated_values_storage = std::move(accumulated_values);
+      
+      // Step 4: Use MSET to set accumulated values (grouped by bucket)
+      const int mset_argc = total * 2 + 1;
+      const unsigned &&mset_vector_len =
+          (static_cast<int64_t>(reinterpret_cast<int>(mset_argc)) /
+           this->redis_connection_params.storage_slice) +
+          1;
+      
+      thread_context->HandleReserve(storage_slice, mset_vector_len, total);
+      
+      const static char *mset_command = "MSET";
+      const static std::size_t mset_command_byte = 4;
+      
+      // Push command for each bucket first
       for (unsigned i = 0; i < storage_slice; ++i) {
-        results.emplace_back(
-            network_worker_pool->enqueue([this, &cmd, thread_context, i] {
-              return PipeExecWrite(cmd, 6U, thread_context->buckets[i]);
-            }));
+        thread_context->HandlePushBack(i, mset_command, mset_command_byte);
       }
-      for (auto &&result : results) {
-        result.wait();
+      
+      // Push keys and values for each bucket
+      for (unsigned bucket = 0; bucket < storage_slice; ++bucket) {
+        for (int key_idx : bucket_key_indices[bucket]) {
+          thread_context->HandlePushBack(bucket, full_keys[key_idx].data(), full_keys[key_idx].size());
+          thread_context->HandlePushBack(bucket, 
+                                         accumulated_values[key_idx].data(), 
+                                         V_byte_size);
+        }
       }
-      if (error_ptr) {
-        std::rethrow_exception(error_ptr);
+      
+      auto mset_cmd = [](::sw::redis::Connection &connection,
+                         const ::sw::redis::StringView &hkey,
+                         const std::vector<const char *> *ptrs_i,
+                         const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "MSET") == 0);
+        assert(sizes_i->front() == 4);
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+      
+      std::vector<
+          std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
+          results;
+      try {
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          results.emplace_back(
+              network_worker_pool->enqueue([this, &mset_cmd, thread_context, i] {
+                return PipeExecWrite(mset_cmd, 4U, thread_context->buckets[i]);
+              }));
+        }
+        for (auto &&result : results) {
+          result.wait();
+        }
+        if (error_ptr) {
+          std::rethrow_exception(error_ptr);
+        }
+      } catch (const std::exception &err) {
+        error_ptr = nullptr;
+        return errors::Unknown(err.what());
       }
-    } catch (const std::exception &err) {
-      error_ptr = nullptr;
-      return errors::Unknown(err.what());
-    }
 
-    return Status::OK();
+      return Status::OK();
+    } else {
+      // Large key mode: use HMACCUM (original implementation)
+      const int argc = total * 2 + 4;
+
+      const static char *redis_command = "HMACCUM";
+      const static std::size_t &&redis_command_byte = 7;
+      size_t dtype_str_size = values_dtype_str.size();
+
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
+
+      const std::size_t &&V_byte_size = Velems_per_dim0 * sizeof(V);
+
+      const V *pv_raw = values_or_delta + begin * Velems_per_dim0;
+
+      const unsigned &storage_slice = this->redis_connection_params.storage_slice;
+      const unsigned &&vector_len =
+          (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
+           this->redis_connection_params.storage_slice) +
+          4;
+
+      thread_context->HandleReserve(storage_slice, vector_len, total);
+
+      for (unsigned i = 0; i < storage_slice; ++i) {
+        thread_context->HandlePushBack(i, redis_command, redis_command_byte);
+        thread_context->HandlePushBack(i, keys_prefix_name_slices[i].data(),
+                                       keys_prefix_name_slices[i].size());
+        thread_context->HandlePushBack(i, values_dtype_str.c_str(),
+                                       dtype_str_size);
+      }
+
+      VContentAndTypeSizeResult VCATS_temp;
+      // std::vector<char> for storage all string in one KV pair
+      std::vector<std::vector<char>> buff_temp(total);
+      unsigned key_bucket_locs = 0;
+      for (int i = 0; pk_raw != pk_raw_end;
+           ++i, ++pk_raw, pv_raw += Velems_per_dim0) {
+        VCATS_temp = VContentAndTypeSize<V>(VCATS_temp, Velems_per_dim0,
+                                            V_byte_size, pv_raw, buff_temp[i]);
+        key_bucket_locs =
+            KBucketNum<K>(this->K_bucket_num_handle, pk_raw,
+                          storage_slice);  // TODO: change it to AVX512
+
+        // Direct access to Tensor data in TensorFlow
+        thread_context->HandlePushBack(
+            key_bucket_locs, KContentPointer<K>(pk_raw), KTypeSize<K>(pk_raw));
+        thread_context->HandlePushBack(
+            key_bucket_locs, VCATS_temp.VContentPointer, VCATS_temp.VTypeSize);
+      }
+
+      const bool *pe_raw = exists + begin;
+      for (unsigned i = 0; i < storage_slice; ++i) {
+        thread_context->HandlePushBack(i, KContentPointer<bool>(pe_raw),
+                                       total * KTypeSize<bool>(pe_raw));
+      }
+
+      auto cmd = [](::sw::redis::Connection &connection,
+                    const ::sw::redis::StringView &hkey,
+                    const std::vector<const char *> *ptrs_i,
+                    const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "HMACCUM") == 0);
+        assert(sizes_i->front() == redis_command_byte);
+        assert(std::string(hkey.data()).compare(ptrs_i[1]) == 0);
+
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+
+      std::vector<
+          std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
+          results;
+      try {
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          results.emplace_back(
+              network_worker_pool->enqueue([this, &cmd, thread_context, i] {
+                return PipeExecWrite(cmd, 6U, thread_context->buckets[i]);
+              }));
+        }
+        for (auto &&result : results) {
+          result.wait();
+        }
+        if (error_ptr) {
+          std::rethrow_exception(error_ptr);
+        }
+      } catch (const std::exception &err) {
+        error_ptr = nullptr;
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
+    }
   }
 
   virtual Status DelCommand(
       const K *keys, ThreadContext *thread_context, const int64_t begin,
       const int64_t max_i,
       const std::vector<std::string> &keys_prefix_name_slices) override {
-    const int &&total = max_i - begin;
-    const int &&argc = total + 2;
+    const int total = max_i - begin;
+    
+    if (this->redis_connection_params.using_small_key) {
+      // Small key mode: use DEL with full keys (prefix:id)
+      const int argc = total + 1;
+      const static char *redis_command = "DEL";
+      const static std::size_t redis_command_byte = 3;
 
-    const static char *redis_command = "HDEL";
-    const static std::size_t &&redis_command_byte = 4;
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
 
-    const K *const pk_raw_end = keys + max_i;
-    const K *pk_raw = keys + begin;
+      const unsigned &storage_slice = this->redis_connection_params.storage_slice;
+      const unsigned &&vector_len =
+          (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
+           this->redis_connection_params.storage_slice) +
+          1;
 
-    const unsigned &storage_slice = this->redis_connection_params.storage_slice;
-    const unsigned &&vector_len =
-        (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
-         this->redis_connection_params.storage_slice) +
-        2;
+      thread_context->HandleReserve(storage_slice, vector_len, total);
 
-    thread_context->HandleReserve(storage_slice, vector_len, total);
+      // Store full key strings in thread context
+      std::vector<std::string> full_keys;
+      full_keys.reserve(total);
+      
+      const char separator = ':';
 
-    for (unsigned i = 0; i < storage_slice; ++i) {
-      thread_context->HandlePushBack(i, redis_command, redis_command_byte);
-      thread_context->HandlePushBack(i, keys_prefix_name_slices[i].data(),
-                                     keys_prefix_name_slices[i].size());
-    }
-
-    unsigned *pbucket_loc = thread_context->bucket_locs->data();
-    unsigned key_bucket_locs = 0;
-    for (; pk_raw != pk_raw_end; ++pk_raw) {
-      key_bucket_locs =
-          KBucketNum<K>(this->K_bucket_num_handle, pk_raw, storage_slice);
-      // The bucket to which the key belongs is recorded to facilitate future
-      // memory writes that do not recompute the redis hash
-      *pbucket_loc = key_bucket_locs;
-      ++pbucket_loc;
-
-      // Direct access to Tensor data in TensorFlow
-      thread_context->HandlePushBack(
-          key_bucket_locs, KContentPointer<K>(pk_raw), KTypeSize<K>(pk_raw));
-    }
-
-    auto cmd = [](::sw::redis::Connection &connection,
-                  const ::sw::redis::StringView hkey,
-                  const std::vector<const char *> *ptrs_i,
-                  const std::vector<std::size_t> *sizes_i) {
-      assert(strcmp(ptrs_i->front(), "HDEL") == 0);
-      assert(sizes_i->front() == 4);
-      assert(std::string(hkey.data()).compare(ptrs_i[1]) == 0);
-
-      connection.send(static_cast<int>(ptrs_i->size()),
-                      const_cast<const char **>(ptrs_i->data()),
-                      sizes_i->data());
-    };
-
-    std::vector<
-        std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
-        results;
-    try {
+      // Push command for each bucket first
       for (unsigned i = 0; i < storage_slice; ++i) {
-        results.emplace_back(
-            network_worker_pool->enqueue([this, &cmd, thread_context, i] {
-              return PipeExecWrite(cmd, 3U, thread_context->buckets[i]);
-            }));
+        thread_context->HandlePushBack(i, redis_command, redis_command_byte);
       }
-      for (auto &&result : results) {
-        result.wait();
-      }
-      if (error_ptr) {
-        std::rethrow_exception(error_ptr);
-      }
-    } catch (const std::exception &err) {
-      error_ptr = nullptr;
-      return errors::Unknown(err.what());
-    }
 
-    return Status::OK();
+      unsigned *pbucket_loc = thread_context->bucket_locs->data();
+      unsigned key_bucket_locs = 0;
+      
+      for (; pk_raw != pk_raw_end; ++pk_raw) {
+        key_bucket_locs =
+            KBucketNum<K>(this->K_bucket_num_handle, pk_raw, storage_slice);
+        *pbucket_loc = key_bucket_locs;
+        ++pbucket_loc;
+
+        // Build full key: prefix:id
+        const std::string &prefix = keys_prefix_name_slices[key_bucket_locs];
+        std::string full_key = prefix + separator;
+        if (std::is_same<K, tstring>::value) {
+          full_key += std::string(pk_raw->data(), pk_raw->size());
+        } else {
+          full_key += std::to_string(*pk_raw);
+        }
+        full_keys.push_back(full_key);
+
+        // Direct access to Tensor data in TensorFlow
+        thread_context->HandlePushBack(
+            key_bucket_locs, full_keys.back().data(), full_keys.back().size());
+      }
+
+      // Store full_keys in thread_context to keep strings alive
+      thread_context->full_keys_storage = std::move(full_keys);
+
+      auto cmd = [](::sw::redis::Connection &connection,
+                    const ::sw::redis::StringView hkey,
+                    const std::vector<const char *> *ptrs_i,
+                    const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "DEL") == 0);
+        assert(sizes_i->front() == 3);
+
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+
+      std::vector<
+          std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
+          results;
+      try {
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          results.emplace_back(
+              network_worker_pool->enqueue([this, &cmd, thread_context, i] {
+                return PipeExecWrite(cmd, 3U, thread_context->buckets[i]);
+              }));
+        }
+        for (auto &&result : results) {
+          result.wait();
+        }
+        if (error_ptr) {
+          std::rethrow_exception(error_ptr);
+        }
+      } catch (const std::exception &err) {
+        error_ptr = nullptr;
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
+    } else {
+      // Large key mode: use HDEL (original implementation)
+      const int argc = total + 2;
+
+      const static char *redis_command = "HDEL";
+      const static std::size_t &&redis_command_byte = 4;
+
+      const K *const pk_raw_end = keys + max_i;
+      const K *pk_raw = keys + begin;
+
+      const unsigned &storage_slice = this->redis_connection_params.storage_slice;
+      const unsigned &&vector_len =
+          (static_cast<int64_t>(reinterpret_cast<int>(argc)) /
+           this->redis_connection_params.storage_slice) +
+          2;
+
+      thread_context->HandleReserve(storage_slice, vector_len, total);
+
+      for (unsigned i = 0; i < storage_slice; ++i) {
+        thread_context->HandlePushBack(i, redis_command, redis_command_byte);
+        thread_context->HandlePushBack(i, keys_prefix_name_slices[i].data(),
+                                       keys_prefix_name_slices[i].size());
+      }
+
+      unsigned *pbucket_loc = thread_context->bucket_locs->data();
+      unsigned key_bucket_locs = 0;
+      for (; pk_raw != pk_raw_end; ++pk_raw) {
+        key_bucket_locs =
+            KBucketNum<K>(this->K_bucket_num_handle, pk_raw, storage_slice);
+        // The bucket to which the key belongs is recorded to facilitate future
+        // memory writes that do not recompute the redis hash
+        *pbucket_loc = key_bucket_locs;
+        ++pbucket_loc;
+
+        // Direct access to Tensor data in TensorFlow
+        thread_context->HandlePushBack(
+            key_bucket_locs, KContentPointer<K>(pk_raw), KTypeSize<K>(pk_raw));
+      }
+
+      auto cmd = [](::sw::redis::Connection &connection,
+                    const ::sw::redis::StringView hkey,
+                    const std::vector<const char *> *ptrs_i,
+                    const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "HDEL") == 0);
+        assert(sizes_i->front() == 4);
+        assert(std::string(hkey.data()).compare(ptrs_i[1]) == 0);
+
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+
+      std::vector<
+          std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
+          results;
+      try {
+        for (unsigned i = 0; i < storage_slice; ++i) {
+          results.emplace_back(
+              network_worker_pool->enqueue([this, &cmd, thread_context, i] {
+                return PipeExecWrite(cmd, 3U, thread_context->buckets[i]);
+              }));
+        }
+        for (auto &&result : results) {
+          result.wait();
+        }
+        if (error_ptr) {
+          std::rethrow_exception(error_ptr);
+        }
+      } catch (const std::exception &err) {
+        error_ptr = nullptr;
+        return errors::Unknown(err.what());
+      }
+
+      return Status::OK();
+    }
   }
 };  // namespace redis_connection
 }  // namespace redis_connection

@@ -568,6 +568,10 @@ class RedisTableOfTensors final : public LookupInterface {
     long long cursor = 0;
 
     redisReply *temp_reply;
+    
+    // Create ThreadContext for small key mode to store MGET reply
+    ThreadContext recreate_thread_context;
+    
     for (size_t i = 0; i < keys_prefix_name_slices_in_redis.size(); ++i) {
       slice_keys_size = _table_instance->TableSizeInBucket(
           keys_prefix_name_slices_in_redis[i]);
@@ -584,9 +588,11 @@ class RedisTableOfTensors final : public LookupInterface {
         cursor = 0;
         while (true) {
           hscan_reply.reset();
+          // Pass ThreadContext to HscanGetKeysValsInBucket for small key mode
           hscan_reply = std::move(_table_instance->HscanGetKeysValsInBucket(
               keys_prefix_name_slices_in_redis[i], &cursor,
-              multi_redis_cmd_max_argc));
+              multi_redis_cmd_max_argc,
+              redis_connection_params.using_small_key ? &recreate_thread_context : nullptr));
           if (hscan_reply == nullptr) {
             return errors::Unknown(
                 "Unknown errors happen when HscanGetKeysValsInBucket in "
@@ -595,28 +601,92 @@ class RedisTableOfTensors final : public LookupInterface {
           if (hscan_reply->type == REDIS_REPLY_ARRAY &&
               hscan_reply->elements > 1) {
             kvs_reply = hscan_reply->element[1];
-            // fill Tensor keys and values
-            for (size_t j = 0; j < kvs_reply->elements; ++j) {
-              temp_reply = kvs_reply->element[j];
-              if (temp_reply->type ==
-                  REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
-                ReplyMemcpyToKeyTensor<K>(
-                    pk_raw, temp_reply->str,
-                    temp_reply
-                        ->len);  // Direct access to Tensor data in TensorFlow
+            
+            if (redis_connection_params.using_small_key) {
+              // Small key mode: SCAN returns only keys (full keys with prefix:id format)
+              // MGET reply is stored in ThreadContext by HscanGetKeysValsInBucket
+              const std::string &prefix = keys_prefix_name_slices_in_redis[i];
+              const char separator = ':';
+              
+              // Get MGET reply from ThreadContext
+              const redisReply *mget_reply = nullptr;
+              if (recreate_thread_context.mget_reply_storage) {
+                mget_reply = recreate_thread_context.mget_reply_storage.get();
               }
-              ++pk_raw;
+              
+              // Process keys and values
+              for (size_t j = 0; j < kvs_reply->elements; ++j) {
+                temp_reply = kvs_reply->element[j];
+                if (temp_reply->type == REDIS_REPLY_STRING) {
+                  std::string full_key(temp_reply->str, temp_reply->len);
+                  
+                  // Extract id from full key (prefix:id -> id)
+                  size_t sep_pos = full_key.find(separator);
+                  if (sep_pos != std::string::npos && sep_pos < full_key.length() - 1) {
+                    std::string id_str = full_key.substr(sep_pos + 1);
+                    
+                    // Store key (id)
+                    if (std::is_same<K, tstring>::value) {
+                      ReplyMemcpyToKeyTensor<K>(pk_raw, id_str.data(), id_str.size());
+                    } else {
+                      // For numeric types, parse the string
+                      try {
+                        if (std::is_same<K, int64_t>::value) {
+                          int64_t id_val = std::stoll(id_str);
+                          *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
+                        } else if (std::is_same<K, int32_t>::value) {
+                          int32_t id_val = std::stoi(id_str);
+                          *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
+                        }
+                      } catch (...) {
+                        LOG(WARNING) << "Failed to parse id from key: " << full_key;
+                        *const_cast<K*>(pk_raw) = static_cast<K>(0);
+                      }
+                    }
+                  }
+                }
+                ++pk_raw;
+                
+                // Store value from MGET reply
+                V *pv_raw_mutable = const_cast<V*>(pv_raw);
+                if (mget_reply && mget_reply->type == REDIS_REPLY_ARRAY && 
+                    j < mget_reply->elements) {
+                  redisReply *val_reply = mget_reply->element[j];
+                  if (val_reply && val_reply->type == REDIS_REPLY_STRING) {
+                    ReplyMemcpyToValTensor<V>(pv_raw_mutable, val_reply->str, runtime_value_dim_);
+                  }
+                  // If value is null or missing, it remains as default (zero)
+                }
+                pv_raw += runtime_value_dim_;
+              }
+              
+              // Clear MGET reply storage for next iteration
+              recreate_thread_context.mget_reply_storage.reset();
+            } else {
+              // Large key mode: HSCAN returns key-value pairs (original implementation)
+              // fill Tensor keys and values
+              for (size_t j = 0; j < kvs_reply->elements; ++j) {
+                temp_reply = kvs_reply->element[j];
+                if (temp_reply->type ==
+                    REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
+                  ReplyMemcpyToKeyTensor<K>(
+                      pk_raw, temp_reply->str,
+                      temp_reply
+                          ->len);  // Direct access to Tensor data in TensorFlow
+                }
+                ++pk_raw;
 
-              ++j;
-              temp_reply = kvs_reply->element[j];
-              if (temp_reply->type ==
-                  REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
-                ReplyMemcpyToValTensor<V>(
-                    pv_raw, temp_reply->str,
-                    runtime_value_dim_);  // Direct access to Tensor data in
-                                          // TensorFlow
+                ++j;
+                temp_reply = kvs_reply->element[j];
+                if (temp_reply->type ==
+                    REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
+                  ReplyMemcpyToValTensor<V>(
+                      pv_raw, temp_reply->str,
+                      runtime_value_dim_);  // Direct access to Tensor data in
+                                            // TensorFlow
+                }
+                pv_raw += runtime_value_dim_;
               }
-              pv_raw += runtime_value_dim_;
             }
           }
 
@@ -1005,39 +1075,121 @@ class RedisTableOfTensors final : public LookupInterface {
     redisReply const *temp_reply;
     const K *pk_raw = reinterpret_cast<const K *>(keys->tensor_data().data());
     const V *pv_raw = reinterpret_cast<const V *>(values->tensor_data().data());
+    
+    // Create ThreadContext for small key mode to store MGET reply
+    ThreadContext export_thread_context;
+    
     for (size_t i = 0; i < keys_prefix_name_slices.size(); ++i) {
       cursor = 0;
       while (true) {
         hscan_reply.reset();
+        // Pass ThreadContext to HscanGetKeysValsInBucket for small key mode
         hscan_reply = _table_instance->HscanGetKeysValsInBucket(
-            keys_prefix_name_slices[i], &cursor, multi_redis_cmd_max_argc);
+            keys_prefix_name_slices[i], &cursor, multi_redis_cmd_max_argc,
+            redis_connection_params.using_small_key ? &export_thread_context : nullptr);
         if (hscan_reply == nullptr) {
           return errors::Unknown(
               "Unknown errors happen when HscanGetKeysValsInBucket in "
               "ExportValuesToTensor");
         }
         kvs_reply = hscan_reply->element[1];
-        // fill Tensor keys and values
-        for (size_t j = 0; j < kvs_reply->elements; ++j) {
-          temp_reply = kvs_reply->element[j];
-          if (temp_reply->type ==
-              REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
-            ReplyMemcpyToKeyTensor<K>(
-                pk_raw, temp_reply->str,
-                temp_reply->len);  // Direct access to Tensor data in TensorFlow
+        
+        if (redis_connection_params.using_small_key) {
+          // Small key mode: SCAN returns only keys (full keys with prefix:id format)
+          // MGET reply is stored in ThreadContext by HscanGetKeysValsInBucket
+          const std::string &prefix = keys_prefix_name_slices[i];
+          const char separator = ':';
+          
+          // Collect full keys and extract ids
+          std::vector<std::string> id_strings;
+          id_strings.reserve(kvs_reply->elements);
+          
+          for (size_t j = 0; j < kvs_reply->elements; ++j) {
+            temp_reply = kvs_reply->element[j];
+            if (temp_reply->type == REDIS_REPLY_STRING) {
+              std::string full_key(temp_reply->str, temp_reply->len);
+              
+              // Extract id from full key (prefix:id -> id)
+              size_t sep_pos = full_key.find(separator);
+              if (sep_pos != std::string::npos && sep_pos < full_key.length() - 1) {
+                id_strings.push_back(full_key.substr(sep_pos + 1));
+              } else {
+                id_strings.push_back("");  // Fallback
+              }
+            }
           }
-          ++pk_raw;
+          
+          // Get MGET reply from ThreadContext
+          const redisReply *mget_reply = nullptr;
+          if (export_thread_context.mget_reply_storage) {
+            mget_reply = export_thread_context.mget_reply_storage.get();
+          }
+          
+          // Store ids in keys tensor and values in values tensor
+          V *pv_raw_mutable = const_cast<V*>(pv_raw);
+          for (size_t j = 0; j < id_strings.size(); ++j) {
+            const std::string &id_str = id_strings[j];
+            
+            // Store key
+            if (std::is_same<K, tstring>::value) {
+              ReplyMemcpyToKeyTensor<K>(pk_raw, id_str.data(), id_str.size());
+            } else {
+              // For numeric types, parse the string
+              try {
+                if (std::is_same<K, int64_t>::value) {
+                  int64_t id_val = std::stoll(id_str);
+                  *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
+                } else if (std::is_same<K, int32_t>::value) {
+                  int32_t id_val = std::stoi(id_str);
+                  *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
+                }
+              } catch (...) {
+                LOG(WARNING) << "Failed to parse id from key";
+                // Use zero as fallback
+                *const_cast<K*>(pk_raw) = static_cast<K>(0);
+              }
+            }
+            
+            // Store value from MGET reply stored in ThreadContext
+            if (mget_reply && mget_reply->type == REDIS_REPLY_ARRAY && 
+                j < mget_reply->elements) {
+              redisReply *val_reply = mget_reply->element[j];
+              if (val_reply && val_reply->type == REDIS_REPLY_STRING) {
+                ReplyMemcpyToValTensor<V>(pv_raw_mutable, val_reply->str, runtime_value_dim_);
+              }
+              // If value is null or missing, it remains as default (zero)
+            }
+            
+            ++pk_raw;
+            pv_raw_mutable += runtime_value_dim_;
+            pv_raw = pv_raw_mutable;
+          }
+          
+          // Clear MGET reply storage for next iteration
+          export_thread_context.mget_reply_storage.reset();
+        } else {
+          // Large key mode: HSCAN returns key-value pairs (original implementation)
+          for (size_t j = 0; j < kvs_reply->elements; ++j) {
+            temp_reply = kvs_reply->element[j];
+            if (temp_reply->type ==
+                REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
+              ReplyMemcpyToKeyTensor<K>(
+                  pk_raw, temp_reply->str,
+                  temp_reply->len);  // Direct access to Tensor data in TensorFlow
+            }
+            ++pk_raw;
 
-          ++j;
-          temp_reply = kvs_reply->element[j];
-          if (temp_reply->type ==
-              REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
-            ReplyMemcpyToValTensor<V>(
-                pv_raw, temp_reply->str,
-                runtime_value_dim_);  // Direct access to Tensor data in
-                                      // TensorFlow
+            ++j;
+            temp_reply = kvs_reply->element[j];
+            if (temp_reply->type ==
+                REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
+              ReplyMemcpyToValTensor<V>(
+                  pv_raw, temp_reply->str,
+                  runtime_value_dim_);  // Direct access to Tensor data in
+                                        // TensorFlow
+            }
+            pv_raw += runtime_value_dim_;
           }
-          pv_raw += runtime_value_dim_;
         }
 
         LOG(INFO) << "The cursor of scanning " << keys_prefix_name_slices[i]
@@ -1109,50 +1261,134 @@ class RedisTableOfTensors final : public LookupInterface {
     redisReply const *temp_reply;
     const K *pk_raw = reinterpret_cast<const K *>(key_buffer_vector.data());
     const V *pv_raw = reinterpret_cast<const V *>(value_buffer_vector.data());
+    
+    // Create ThreadContext for small key mode to store MGET reply
+    ThreadContext save_thread_context;
+    
     for (size_t i = 0; i < keys_prefix_name_slices.size(); ++i) {
       cursor = 0;
       while (true) {
         hscan_reply.reset();
+        // Pass ThreadContext to HscanGetKeysValsInBucket for small key mode
         hscan_reply = _table_instance->HscanGetKeysValsInBucket(
-            keys_prefix_name_slices[i], &cursor, multi_redis_cmd_max_argc);
+            keys_prefix_name_slices[i], &cursor, multi_redis_cmd_max_argc,
+            redis_connection_params.using_small_key ? &save_thread_context : nullptr);
         if (hscan_reply == nullptr) {
           return errors::Unknown(
               "Unknown errors happen when HscanGetKeysValsInBucket in "
               "SaveToFileSystemImpl");
         }
         kvs_reply = hscan_reply->element[1];
-        // fill Tensor keys and values
-        for (size_t j = 0; j < kvs_reply->elements; ++j) {
-          temp_reply = kvs_reply->element[j];
-          if (temp_reply->type ==
-              REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
-            ReplyMemcpyToKeyTensor<K>(
-                pk_raw, temp_reply->str,
-                temp_reply->len);  // Direct access to Tensor data in TensorFlow
+        
+        if (redis_connection_params.using_small_key) {
+          // Small key mode: SCAN returns only keys (full keys with prefix:id format)
+          // MGET reply is stored in ThreadContext by HscanGetKeysValsInBucket
+          const std::string &prefix = keys_prefix_name_slices[i];
+          const char separator = ':';
+          
+          // Get MGET reply from ThreadContext
+          const redisReply *mget_reply = nullptr;
+          if (save_thread_context.mget_reply_storage) {
+            mget_reply = save_thread_context.mget_reply_storage.get();
           }
-          ++pk_raw;
+          
+          // Process keys and values
+          for (size_t j = 0; j < kvs_reply->elements; ++j) {
+            temp_reply = kvs_reply->element[j];
+            if (temp_reply->type == REDIS_REPLY_STRING) {
+              std::string full_key(temp_reply->str, temp_reply->len);
+              
+              // Extract id from full key (prefix:id -> id)
+              size_t sep_pos = full_key.find(separator);
+              std::string id_str;
+              if (sep_pos != std::string::npos && sep_pos < full_key.length() - 1) {
+                id_str = full_key.substr(sep_pos + 1);
+              }
+              
+              // Store key (id)
+              if (!id_str.empty()) {
+                if (std::is_same<K, tstring>::value) {
+                  ReplyMemcpyToKeyTensor<K>(pk_raw, id_str.data(), id_str.size());
+                } else {
+                  // For numeric types, parse the string
+                  try {
+                    if (std::is_same<K, int64_t>::value) {
+                      int64_t id_val = std::stoll(id_str);
+                      *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
+                    } else if (std::is_same<K, int32_t>::value) {
+                      int32_t id_val = std::stoi(id_str);
+                      *const_cast<K*>(pk_raw) = static_cast<K>(id_val);
+                    }
+                  } catch (...) {
+                    LOG(WARNING) << "Failed to parse id from key: " << full_key;
+                    *const_cast<K*>(pk_raw) = static_cast<K>(0);
+                  }
+                }
+              }
+            }
+            ++pk_raw;
+            
+            // Store value from MGET reply
+            V *pv_raw_mutable = const_cast<V*>(pv_raw);
+            if (mget_reply && mget_reply->type == REDIS_REPLY_ARRAY && 
+                j < mget_reply->elements) {
+              redisReply *val_reply = mget_reply->element[j];
+              if (val_reply && val_reply->type == REDIS_REPLY_STRING) {
+                ReplyMemcpyToValTensor<V>(pv_raw_mutable, val_reply->str, runtime_value_dim_);
+              }
+              // If value is null or missing, it remains as default (zero)
+            }
+            pv_raw += runtime_value_dim_;
 
-          ++j;
-          temp_reply = kvs_reply->element[j];
-          if (temp_reply->type ==
-              REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
-            ReplyMemcpyToValTensor<V>(
-                pv_raw, temp_reply->str,
-                runtime_value_dim_);  // Direct access to Tensor data in
-                                      // TensorFlow
+            if (((char *)pk_raw - key_buffer_vector.data()) >=
+                static_cast<int64_t>(key_buffer_byte_size)) {
+              pk_raw = reinterpret_cast<const K *>(key_buffer_vector.data());
+              TF_RETURN_IF_ERROR(key_writer->Append(
+                  StringPiece((char *)pk_raw, key_buffer_byte_size)));
+              pv_raw = reinterpret_cast<const V *>(value_buffer_vector.data());
+              TF_RETURN_IF_ERROR(value_writer->Append(
+                  StringPiece((char *)pv_raw, value_buffer_byte_size)));
+            }
+            ++total_saved;
           }
-          pv_raw += runtime_value_dim_;
+          
+          // Clear MGET reply storage for next iteration
+          save_thread_context.mget_reply_storage.reset();
+        } else {
+          // Large key mode: HSCAN returns key-value pairs (original implementation)
+          // fill Tensor keys and values
+          for (size_t j = 0; j < kvs_reply->elements; ++j) {
+            temp_reply = kvs_reply->element[j];
+            if (temp_reply->type ==
+                REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
+              ReplyMemcpyToKeyTensor<K>(
+                  pk_raw, temp_reply->str,
+                  temp_reply->len);  // Direct access to Tensor data in TensorFlow
+            }
+            ++pk_raw;
 
-          if (((char *)pk_raw - key_buffer_vector.data()) >=
-              static_cast<int64_t>(key_buffer_byte_size)) {
-            pk_raw = reinterpret_cast<const K *>(key_buffer_vector.data());
-            TF_RETURN_IF_ERROR(key_writer->Append(
-                StringPiece((char *)pk_raw, key_buffer_byte_size)));
-            pv_raw = reinterpret_cast<const V *>(value_buffer_vector.data());
-            TF_RETURN_IF_ERROR(value_writer->Append(
-                StringPiece((char *)pv_raw, value_buffer_byte_size)));
+            ++j;
+            temp_reply = kvs_reply->element[j];
+            if (temp_reply->type ==
+                REDIS_REPLY_STRING) {  // #define REDIS_REPLY_STRING 1
+              ReplyMemcpyToValTensor<V>(
+                  pv_raw, temp_reply->str,
+                  runtime_value_dim_);  // Direct access to Tensor data in
+                                        // TensorFlow
+            }
+            pv_raw += runtime_value_dim_;
+
+            if (((char *)pk_raw - key_buffer_vector.data()) >=
+                static_cast<int64_t>(key_buffer_byte_size)) {
+              pk_raw = reinterpret_cast<const K *>(key_buffer_vector.data());
+              TF_RETURN_IF_ERROR(key_writer->Append(
+                  StringPiece((char *)pk_raw, key_buffer_byte_size)));
+              pv_raw = reinterpret_cast<const V *>(value_buffer_vector.data());
+              TF_RETURN_IF_ERROR(value_writer->Append(
+                  StringPiece((char *)pv_raw, value_buffer_byte_size)));
+            }
+            ++total_saved;
           }
-          ++total_saved;
         }
 
         LOG(INFO) << "The cursor of scanning " << keys_prefix_name_slices[i]
