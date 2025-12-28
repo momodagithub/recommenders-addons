@@ -1186,22 +1186,22 @@ every bucket has its own BucketContext for sending data---for locating reply-
       for (unsigned i = 0; i < storage_slice; ++i) {
         replies[i] = std::move(nullptr);
       }
+      auto mget_cmd = [](::sw::redis::Connection &connection,
+                         const ::sw::redis::StringView hkey,
+                         const std::vector<const char *> *ptrs_i,
+                         const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "MGET") == 0);
+        assert(sizes_i->front() == 4);
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+      
       try {
         for (unsigned i = 0; i < storage_slice; ++i) {
           results.emplace_back(
-              network_worker_pool->enqueue([this, thread_context, i] {
-                return PipeExecRead(
-                    [](::sw::redis::Connection &connection,
-                       const ::sw::redis::StringView hkey,
-                       const std::vector<const char *> *ptrs_i,
-                       const std::vector<std::size_t> *sizes_i) {
-                      assert(strcmp(ptrs_i->front(), "MGET") == 0);
-                      assert(sizes_i->front() == 4);
-                      connection.send(static_cast<int>(ptrs_i->size()),
-                                      const_cast<const char **>(ptrs_i->data()),
-                                      sizes_i->data());
-                    },
-                    3U, thread_context->buckets[i]);
+              network_worker_pool->enqueue([this, &mget_cmd, thread_context, i] {
+                return PipeExecRead(mget_cmd, 3U, thread_context->buckets[i]);
               }));
         }
         for (unsigned i = 0; i < storage_slice; ++i) {
@@ -1485,25 +1485,25 @@ every bucket has its own BucketContext for sending data---for locating reply-
       // Store full_keys in thread_context to keep strings alive
       thread_context->full_keys_storage = std::move(full_keys);
 
+      auto mset_write_cmd = [](::sw::redis::Connection &connection,
+                               const ::sw::redis::StringView &hkey,
+                               const std::vector<const char *> *ptrs_i,
+                               const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "MSET") == 0);
+        assert(sizes_i->front() == 4);
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+
       std::vector<
           std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
           results;
       try {
         for (unsigned i = 0; i < storage_slice; ++i) {
           results.emplace_back(
-              network_worker_pool->enqueue([this, thread_context, i] {
-                return PipeExecWrite(
-                    [](::sw::redis::Connection &connection,
-                       const ::sw::redis::StringView &hkey,
-                       const std::vector<const char *> *ptrs_i,
-                       const std::vector<std::size_t> *sizes_i) {
-                      assert(strcmp(ptrs_i->front(), "MSET") == 0);
-                      assert(sizes_i->front() == 4);
-                      connection.send(static_cast<int>(ptrs_i->size()),
-                                      const_cast<const char **>(ptrs_i->data()),
-                                      sizes_i->data());
-                    },
-                    4U, thread_context->buckets[i]);
+              network_worker_pool->enqueue([this, &mset_write_cmd, thread_context, i] {
+                return PipeExecWrite(mset_write_cmd, 4U, thread_context->buckets[i]);
               }));
         }
         for (auto &&result : results) {
@@ -1770,25 +1770,25 @@ every bucket has its own BucketContext for sending data---for locating reply-
         }
       }
       
+      auto mset_accum_cmd = [](::sw::redis::Connection &connection,
+                               const ::sw::redis::StringView &hkey,
+                               const std::vector<const char *> *ptrs_i,
+                               const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "MSET") == 0);
+        assert(sizes_i->front() == 4);
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+      
       std::vector<
           std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
           results;
       try {
         for (unsigned i = 0; i < storage_slice; ++i) {
           results.emplace_back(
-              network_worker_pool->enqueue([this, thread_context, i] {
-                return PipeExecWrite(
-                    [](::sw::redis::Connection &connection,
-                       const ::sw::redis::StringView &hkey,
-                       const std::vector<const char *> *ptrs_i,
-                       const std::vector<std::size_t> *sizes_i) {
-                      assert(strcmp(ptrs_i->front(), "MSET") == 0);
-                      assert(sizes_i->front() == 4);
-                      connection.send(static_cast<int>(ptrs_i->size()),
-                                      const_cast<const char **>(ptrs_i->data()),
-                                      sizes_i->data());
-                    },
-                    4U, thread_context->buckets[i]);
+              network_worker_pool->enqueue([this, &mset_accum_cmd, thread_context, i] {
+                return PipeExecWrite(mset_accum_cmd, 4U, thread_context->buckets[i]);
               }));
         }
         for (auto &&result : results) {
@@ -1958,25 +1958,25 @@ every bucket has its own BucketContext for sending data---for locating reply-
       // Store full_keys in thread_context to keep strings alive
       thread_context->full_keys_storage = std::move(full_keys);
 
+      auto del_cmd = [](::sw::redis::Connection &connection,
+                        const ::sw::redis::StringView hkey,
+                        const std::vector<const char *> *ptrs_i,
+                        const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "DEL") == 0);
+        assert(sizes_i->front() == 3);
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+      
       std::vector<
           std::future<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>>>
           results;
       try {
         for (unsigned i = 0; i < storage_slice; ++i) {
           results.emplace_back(
-              network_worker_pool->enqueue([this, thread_context, i] {
-                return PipeExecWrite(
-                    [](::sw::redis::Connection &connection,
-                       const ::sw::redis::StringView hkey,
-                       const std::vector<const char *> *ptrs_i,
-                       const std::vector<std::size_t> *sizes_i) {
-                      assert(strcmp(ptrs_i->front(), "DEL") == 0);
-                      assert(sizes_i->front() == 3);
-                      connection.send(static_cast<int>(ptrs_i->size()),
-                                      const_cast<const char **>(ptrs_i->data()),
-                                      sizes_i->data());
-                    },
-                    3U, thread_context->buckets[i]);
+              network_worker_pool->enqueue([this, &del_cmd, thread_context, i] {
+                return PipeExecWrite(del_cmd, 3U, thread_context->buckets[i]);
               }));
         }
         for (auto &&result : results) {
