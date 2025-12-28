@@ -1646,6 +1646,17 @@ every bucket has its own BucketContext for sending data---for locating reply-
       thread_context->full_keys_storage = full_keys;  // Keep strings alive
       
       // Step 2: For each bucket, use MGET to get old values
+      auto mget_accum_cmd = [](::sw::redis::Connection &connection,
+                               const ::sw::redis::StringView hkey,
+                               const std::vector<const char *> *ptrs_i,
+                               const std::vector<std::size_t> *sizes_i) {
+        assert(strcmp(ptrs_i->front(), "MGET") == 0);
+        assert(sizes_i->front() == 4);
+        connection.send(static_cast<int>(ptrs_i->size()),
+                        const_cast<const char **>(ptrs_i->data()),
+                        sizes_i->data());
+      };
+      
       std::vector<std::unique_ptr<redisReply, ::sw::redis::ReplyDeleter>> mget_replies(storage_slice);
       for (unsigned bucket = 0; bucket < storage_slice; ++bucket) {
         if (bucket_key_indices[bucket].empty()) {
@@ -1677,18 +1688,7 @@ every bucket has its own BucketContext for sending data---for locating reply-
         }
         
         try {
-          mget_replies[bucket] = PipeExecRead(
-              [](::sw::redis::Connection &connection,
-                 const ::sw::redis::StringView hkey,
-                 const std::vector<const char *> *ptrs_i,
-                 const std::vector<std::size_t> *sizes_i) {
-                assert(strcmp(ptrs_i->front(), "MGET") == 0);
-                assert(sizes_i->front() == 4);
-                connection.send(static_cast<int>(ptrs_i->size()),
-                                const_cast<const char **>(ptrs_i->data()),
-                                sizes_i->data());
-              },
-              3U, thread_context->buckets[bucket]);
+          mget_replies[bucket] = PipeExecRead(mget_accum_cmd, 3U, thread_context->buckets[bucket]);
         } catch (const std::exception &err) {
           LOG(ERROR) << "RedisHandler error in MACCUM_COMMAND MGET (small key mode, bucket " << bucket << ") "
                      << keys_prefix_name_slices[bucket] << " -- " << err.what();
